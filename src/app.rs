@@ -4,7 +4,7 @@ use std::{
     env,
     fs::{self, File},
     io::{self, Read, Write},
-    path::{Path, PathBuf},
+    path::{Path, PathBuf, MAIN_SEPARATOR},
     process::Command,
     time::Duration,
 };
@@ -44,6 +44,23 @@ pub const MODELS: &[ModelInfo] = &[
         description: "Better accuracy",
     },
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelState {
+    Installed,
+    Missing,
+    Corrupt,
+}
+
+impl ModelState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Missing => "missing",
+            Self::Corrupt => "corrupt",
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -90,6 +107,7 @@ impl AppPaths {
 }
 
 pub fn model_by_name(name: &str) -> Option<ModelInfo> {
+    let name = if name == "recommended" { "base" } else { name };
     MODELS.iter().copied().find(|model| model.name == name)
 }
 
@@ -97,9 +115,21 @@ pub fn is_model_installed(paths: &AppPaths, model: ModelInfo) -> bool {
     paths.model_path(model).exists()
 }
 
+pub fn model_state(paths: &AppPaths, model: ModelInfo) -> ModelState {
+    let path = paths.model_path(model);
+    if !path.exists() {
+        return ModelState::Missing;
+    }
+
+    match verify_sha1(&path, model.sha1) {
+        Ok(()) => ModelState::Installed,
+        Err(_) => ModelState::Corrupt,
+    }
+}
+
 pub fn install_model(paths: &AppPaths, requested: &str) -> Result<()> {
     let model = model_by_name(requested).ok_or_else(|| {
-        anyhow!("Unknown model '{requested}'. Supported models: tiny, base, small")
+        anyhow!("Unknown model '{requested}'. Supported models: tiny, base, small, recommended")
     })?;
     let target = paths.model_path(model);
     if target.exists() {
@@ -238,7 +268,11 @@ pub fn short_home_path(path: &Path) -> String {
         if rest.is_empty() {
             "~".to_string()
         } else {
-            format!("~\\{}", rest.trim_start_matches(['\\', '/']))
+            format!(
+                "~{}{}",
+                MAIN_SEPARATOR,
+                rest.trim_start_matches(['\\', '/'])
+            )
         }
     } else {
         path.display().to_string()
@@ -302,4 +336,31 @@ fn current_exe_dir() -> Result<PathBuf> {
     exe.parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("Executable has no parent directory: {}", exe.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, time::SystemTime};
+
+    #[test]
+    fn model_lookup_accepts_recommended_alias() {
+        assert_eq!(model_by_name("recommended").unwrap().name, "base");
+        assert!(model_by_name("missing").is_none());
+    }
+
+    #[test]
+    fn verify_sha1_detects_valid_and_invalid_files() {
+        let path = env::temp_dir().join(format!(
+            "whispercli-sha1-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"abc").unwrap();
+        assert!(verify_sha1(&path, "a9993e364706816aba3e25717850c26c9cd0d89d").is_ok());
+        assert!(verify_sha1(&path, "0000000000000000000000000000000000000000").is_err());
+        let _ = fs::remove_file(path);
+    }
 }

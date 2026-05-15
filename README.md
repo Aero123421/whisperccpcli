@@ -25,11 +25,16 @@ npm install -g whisperccpcli
 whispercli doctor
 ```
 
+npm版インストーラーは `package.json` のバージョン `vX.Y.Z` を既定で取得します。
+必要なら `WHISPERCLI_VERSION`（任意）でインストール対象の GitHub Release タグを上書きできます。
+また `WHISPERCLI_INSTALL_DIR`（インストール先）や `WHISPERCLI_SKIP_DOWNLOAD`（ダウンロードをスキップ）も利用可能です。
+
 ### macOS / Linux
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Aero123421/whisperccpcli/main/scripts/install.sh | sh
 ```
+インストーラーは可能なら `checksums.txt` を取得して SHA256 検証を行います。
 
 ## Setup
 
@@ -38,6 +43,12 @@ whispercli init
 whispercli config
 whispercli models install tiny
 whispercli models list
+```
+
+初回セットアップを1コマンドで済ませる場合:
+
+```powershell
+whispercli init --download tiny
 ```
 
 `whispercli init` は以下を自動作成します。
@@ -68,6 +79,9 @@ With options:
 
 ```powershell
 whispercli live --out meeting.md --model tiny --lang ja
+whispercli live --plain --format txt --out meeting.txt
+whispercli live --jsonl --out live.jsonl
+whispercli file audio.wav --format srt --out transcript.srt
 ```
 
 終了:
@@ -91,17 +105,19 @@ Click Install model / Quit buttons in the TUI.
 - マウスホバー、フォーカス、選択状態の表示
 - `cpal` によるマイク入力
 - `whisper-rs` / `whisper.cpp` によるチャンク文字起こし
-- Markdown / Text への逐次保存
-- 保存先、モデル、言語、状態、入力レベルの表示
+- Markdown / Text / SRT / JSON / JSONL への逐次保存
+- 保存先、モデル、言語、状態、入力レベル、音声drop数の表示
 - `~/.whispercli` の自動作成
-- `tiny` / `base` / `small` モデルのダウンロードとSHA1検証
+- `tiny` / `base` / `small` モデルのダウンロード、SHA1検証、verify/remove
+- `doctor --json`、`config get/set`、`live --plain`、WAVファイル文字起こし
 - GitHub ActionsによるCI/CD
 - npm wrapper
-- Windows用PowerShellインストーラー
+- Windows/macOS/Linux向けRelease binary
+- Windows用PowerShellインストーラー / macOS・Linux用shellインストーラー
 
 ## Later
 
 - 重複除去とVADの精度改善
-- SRT / JSON 出力
-- ファイル音声の文字起こし
-- Windows/macOS/Linux向け単体バイナリ配布
+- Homebrew / Scoop / winget
+- Linux arm64 / musl binary
+- platform別npm package

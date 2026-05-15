@@ -1,6 +1,6 @@
 {
   "name": "whisperccpcli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Lightweight local Whisper CLI with a calm real-time TUI.",
   "bin": {
     "whispercli": "bin/whispercli.js",
@@ -9,6 +9,12 @@
   "scripts": {
     "postinstall": "node ./scripts/install.js"
   },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Aero123421/whisperccpcli.git"

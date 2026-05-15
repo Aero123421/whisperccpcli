@@ -7,6 +7,10 @@ use cpal::{
     SampleFormat, Stream, StreamConfig,
 };
 use crossbeam_channel::Sender;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 #[derive(Clone, Debug)]
 pub struct AudioDeviceInfo {
@@ -22,6 +26,52 @@ pub struct AudioCapture {
     pub device_name: String,
 }
 
+#[derive(Clone)]
+struct CaptureSenders {
+    audio_tx: Sender<Vec<f32>>,
+    level_tx: Sender<f32>,
+    error_tx: Sender<String>,
+    stats: AudioCallbackStats,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioCallbackStats {
+    dropped_audio_chunks: Arc<AtomicU64>,
+    dropped_level_updates: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioCallbackStatsSnapshot {
+    pub dropped_audio_chunks: u64,
+    pub dropped_level_updates: u64,
+}
+
+impl AudioCallbackStats {
+    pub fn snapshot(&self) -> AudioCallbackStatsSnapshot {
+        AudioCallbackStatsSnapshot {
+            dropped_audio_chunks: self.dropped_audio_chunks.load(Ordering::Relaxed),
+            dropped_level_updates: self.dropped_level_updates.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_dropped_audio_chunk(&self) {
+        self.dropped_audio_chunks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_dropped_level_update(&self) {
+        self.dropped_level_updates.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Default for AudioCallbackStats {
+    fn default() -> Self {
+        Self {
+            dropped_audio_chunks: Arc::new(AtomicU64::new(0)),
+            dropped_level_updates: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
 pub fn input_devices() -> Result<Vec<AudioDeviceInfo>> {
     let host = cpal::default_host();
     let default_name = host
@@ -32,6 +82,7 @@ pub fn input_devices() -> Result<Vec<AudioDeviceInfo>> {
         .context("Could not enumerate input devices")?;
 
     let mut out = Vec::new();
+    let mut default_seen = false;
     for (index, device) in devices.enumerate() {
         let name = device
             .name()
@@ -47,10 +98,12 @@ pub fn input_devices() -> Result<Vec<AudioDeviceInfo>> {
                 )
             })
             .unwrap_or_else(|_| "unavailable".to_string());
-        let is_default = default_name
-            .as_ref()
-            .map(|default| default == &name)
-            .unwrap_or(false);
+        let is_default = !default_seen
+            && default_name
+                .as_ref()
+                .map(|default| default == &name)
+                .unwrap_or(false);
+        default_seen |= is_default;
         out.push(AudioDeviceInfo {
             index,
             name,
@@ -66,6 +119,7 @@ pub fn start_capture(
     audio_tx: Sender<Vec<f32>>,
     level_tx: Sender<f32>,
     error_tx: Sender<String>,
+    stats: AudioCallbackStats,
 ) -> Result<AudioCapture> {
     let host = cpal::default_host();
     let device = match selected_name {
@@ -92,80 +146,34 @@ pub fn start_capture(
     let sample_rate = supported_config.sample_rate();
     let channels = supported_config.channels() as usize;
     let config: StreamConfig = supported_config.into();
+    let senders = CaptureSenders {
+        audio_tx,
+        level_tx,
+        error_tx,
+        stats,
+    };
 
     let stream = match sample_format {
-        SampleFormat::F32 => build_stream(
-            &device,
-            &config,
-            channels,
-            audio_tx,
-            level_tx,
-            error_tx,
-            |v: f32| v,
-        ),
-        SampleFormat::F64 => build_stream(
-            &device,
-            &config,
-            channels,
-            audio_tx,
-            level_tx,
-            error_tx,
-            |v: f64| v as f32,
-        ),
-        SampleFormat::I8 => build_stream(
-            &device,
-            &config,
-            channels,
-            audio_tx,
-            level_tx,
-            error_tx,
-            |v: i8| v as f32 / i8::MAX as f32,
-        ),
-        SampleFormat::I16 => build_stream(
-            &device,
-            &config,
-            channels,
-            audio_tx,
-            level_tx,
-            error_tx,
-            |v: i16| v as f32 / i16::MAX as f32,
-        ),
-        SampleFormat::I32 => build_stream(
-            &device,
-            &config,
-            channels,
-            audio_tx,
-            level_tx,
-            error_tx,
-            |v: i32| v as f32 / i32::MAX as f32,
-        ),
-        SampleFormat::U8 => build_stream(
-            &device,
-            &config,
-            channels,
-            audio_tx,
-            level_tx,
-            error_tx,
-            |v: u8| (v as f32 / u8::MAX as f32) * 2.0 - 1.0,
-        ),
-        SampleFormat::U16 => build_stream(
-            &device,
-            &config,
-            channels,
-            audio_tx,
-            level_tx,
-            error_tx,
-            |v: u16| (v as f32 / u16::MAX as f32) * 2.0 - 1.0,
-        ),
-        SampleFormat::U32 => build_stream(
-            &device,
-            &config,
-            channels,
-            audio_tx,
-            level_tx,
-            error_tx,
-            |v: u32| (v as f32 / u32::MAX as f32) * 2.0 - 1.0,
-        ),
+        SampleFormat::F32 => build_stream(&device, &config, channels, senders, |v: f32| v),
+        SampleFormat::F64 => build_stream(&device, &config, channels, senders, |v: f64| v as f32),
+        SampleFormat::I8 => build_stream(&device, &config, channels, senders, |v: i8| {
+            v as f32 / i8::MAX as f32
+        }),
+        SampleFormat::I16 => build_stream(&device, &config, channels, senders, |v: i16| {
+            v as f32 / i16::MAX as f32
+        }),
+        SampleFormat::I32 => build_stream(&device, &config, channels, senders, |v: i32| {
+            v as f32 / i32::MAX as f32
+        }),
+        SampleFormat::U8 => build_stream(&device, &config, channels, senders, |v: u8| {
+            (v as f32 / u8::MAX as f32) * 2.0 - 1.0
+        }),
+        SampleFormat::U16 => build_stream(&device, &config, channels, senders, |v: u16| {
+            (v as f32 / u16::MAX as f32) * 2.0 - 1.0
+        }),
+        SampleFormat::U32 => build_stream(&device, &config, channels, senders, |v: u32| {
+            (v as f32 / u32::MAX as f32) * 2.0 - 1.0
+        }),
         other => bail!("Unsupported input sample format: {other:?}"),
     }?;
 
@@ -184,16 +192,14 @@ fn build_stream<T, F>(
     device: &cpal::Device,
     config: &StreamConfig,
     channels: usize,
-    audio_tx: Sender<Vec<f32>>,
-    level_tx: Sender<f32>,
-    error_tx: Sender<String>,
+    senders: CaptureSenders,
     convert: F,
 ) -> Result<Stream>
 where
     T: cpal::SizedSample + Copy + Send + 'static,
     F: Fn(T) -> f32 + Copy + Send + 'static,
 {
-    let err_sender = error_tx.clone();
+    let err_sender = senders.error_tx.clone();
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _| {
@@ -209,8 +215,12 @@ where
                 mono.push(sample.clamp(-1.0, 1.0));
             }
 
-            let _ = level_tx.try_send(peak.min(1.0));
-            let _ = audio_tx.try_send(mono);
+            if senders.level_tx.try_send(peak.min(1.0)).is_err() {
+                senders.stats.record_dropped_level_update();
+            }
+            if senders.audio_tx.try_send(mono).is_err() {
+                senders.stats.record_dropped_audio_chunk();
+            }
         },
         move |err| {
             let _ = err_sender.try_send(format!("Microphone stream error: {err}"));

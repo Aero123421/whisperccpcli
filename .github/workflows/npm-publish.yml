@@ -1,12 +1,11 @@
-name: npm publish
+name: npm publish manual
 
 on:
   workflow_dispatch:
-  release:
-    types: [published]
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -17,8 +16,12 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
+      - name: Include root docs in npm package
+        run: |
+          cp README.md npm/README.md
+          cp LICENSE npm/LICENSE
       - name: Publish npm wrapper
         working-directory: npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: npm publish --access public --provenance
