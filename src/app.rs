@@ -11,6 +11,7 @@ use std::{
 
 pub const APP_DIR_NAME: &str = ".whispercli";
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+const RECOMMENDED_MODEL: &str = "large-v3-turbo-q5_0";
 
 #[derive(Clone, Copy, Debug)]
 pub struct ModelInfo {
@@ -34,7 +35,7 @@ pub const MODELS: &[ModelInfo] = &[
         file_name: "ggml-base.bin",
         size: "142 MiB",
         sha1: "465707469ff3a37a2b9b8d8f89f2f99de7299dac",
-        description: "Recommended",
+        description: "Balanced",
     },
     ModelInfo {
         name: "small",
@@ -42,6 +43,13 @@ pub const MODELS: &[ModelInfo] = &[
         size: "466 MiB",
         sha1: "55356645c2b361a969dfd0ef2c5a50d530afd8d5",
         description: "Better accuracy",
+    },
+    ModelInfo {
+        name: "large-v3-turbo-q5_0",
+        file_name: "ggml-large-v3-turbo-q5_0.bin",
+        size: "547 MiB",
+        sha1: "e050f7970618a659205450ad97eb95a18d69c9ee",
+        description: "Recommended quality",
     },
 ];
 
@@ -107,8 +115,18 @@ impl AppPaths {
 }
 
 pub fn model_by_name(name: &str) -> Option<ModelInfo> {
-    let name = if name == "recommended" { "base" } else { name };
+    let name = if name == "recommended" {
+        RECOMMENDED_MODEL
+    } else {
+        name
+    };
     MODELS.iter().copied().find(|model| model.name == name)
+}
+
+pub fn supported_model_names() -> String {
+    let mut names = MODELS.iter().map(|model| model.name).collect::<Vec<_>>();
+    names.push("recommended");
+    names.join(", ")
 }
 
 pub fn is_model_installed(paths: &AppPaths, model: ModelInfo) -> bool {
@@ -129,7 +147,10 @@ pub fn model_state(paths: &AppPaths, model: ModelInfo) -> ModelState {
 
 pub fn install_model(paths: &AppPaths, requested: &str) -> Result<()> {
     let model = model_by_name(requested).ok_or_else(|| {
-        anyhow!("Unknown model '{requested}'. Supported models: tiny, base, small, recommended")
+        anyhow!(
+            "Unknown model '{requested}'. Supported models: {}",
+            supported_model_names()
+        )
     })?;
     let target = paths.model_path(model);
     if target.exists() {
@@ -345,7 +366,14 @@ mod tests {
 
     #[test]
     fn model_lookup_accepts_recommended_alias() {
-        assert_eq!(model_by_name("recommended").unwrap().name, "base");
+        assert_eq!(
+            model_by_name("recommended").unwrap().name,
+            "large-v3-turbo-q5_0"
+        );
+        assert_eq!(
+            model_by_name("large-v3-turbo-q5_0").unwrap().sha1,
+            "e050f7970618a659205450ad97eb95a18d69c9ee"
+        );
         assert!(model_by_name("missing").is_none());
     }
 

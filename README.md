@@ -42,6 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/Aero123421/whisperccpcli/main/scrip
 whispercli init
 whispercli config
 whispercli models install tiny
+whispercli models install large-v3-turbo-q5_0
 whispercli models list
 ```
 
@@ -79,10 +80,14 @@ With options:
 
 ```powershell
 whispercli live --out meeting.md --model tiny --lang ja
+whispercli live --out meeting.md --model large-v3-turbo-q5_0 --lang ja
 whispercli live --plain --format txt --out meeting.txt
 whispercli live --jsonl --out live.jsonl
 whispercli file audio.wav --format srt --out transcript.srt
 ```
+
+日本語の安定性を優先する場合は、`tiny` より `large-v3-turbo-q5_0` を推奨します。
+`recommended` は `large-v3-turbo-q5_0` の別名です。
 
 終了:
 
@@ -108,7 +113,7 @@ Click Install model / Quit buttons in the TUI.
 - Markdown / Text / SRT / JSON / JSONL への逐次保存
 - 保存先、モデル、言語、状態、入力レベル、音声drop数の表示
 - `~/.whispercli` の自動作成
-- `tiny` / `base` / `small` モデルのダウンロード、SHA1検証、verify/remove
+- `tiny` / `base` / `small` / `large-v3-turbo-q5_0` モデルのダウンロード、SHA1検証、verify/remove
 - `doctor --json`、`config get/set`、`live --plain`、WAVファイル文字起こし
 - GitHub ActionsによるCI/CD
 - npm wrapper

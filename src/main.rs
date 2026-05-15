@@ -6,14 +6,14 @@ mod transcriber;
 use anyhow::{Context, Result};
 use app::{
     add_current_exe_dir_to_path, install_model, is_model_installed, model_by_name, model_state,
-    verify_sha1, AppPaths, MODELS,
+    supported_model_names, verify_sha1, AppPaths, MODELS,
 };
 use audio::input_devices;
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -166,7 +166,7 @@ enum ModelCommand {
     List,
     /// Download a model into ~/.whispercli/models.
     Install {
-        /// Model name: tiny, base, small, or recommended.
+        /// Model name, for example tiny, small, large-v3-turbo-q5_0, or recommended.
         #[arg(default_value = "tiny")]
         model: String,
     },
@@ -177,7 +177,7 @@ enum ModelCommand {
     },
     /// Remove an installed model.
     Remove {
-        /// Model name: tiny, base, or small.
+        /// Model name, for example tiny, small, or large-v3-turbo-q5_0.
         model: String,
     },
 }
@@ -386,7 +386,7 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     println!("models");
     for model in MODELS {
         let state = model_state(&paths, *model);
-        println!("{:<6} {:<10} {}", model.name, model.size, state.label());
+        println!("{:<22} {:<10} {}", model.name, model.size, state.label());
     }
     println!();
     println!("microphones");
@@ -432,7 +432,7 @@ fn models(command: ModelCommand) -> Result<()> {
                 let path = paths.model_path(*model);
                 let state = model_state(&paths, *model);
                 println!(
-                    "{:<6} {:<10} {:<10} {}",
+                    "{:<22} {:<10} {:<10} {}",
                     model.name,
                     model.size,
                     state.label(),
@@ -451,7 +451,8 @@ fn verify_models(paths: &AppPaths, requested: Option<&str>) -> Result<()> {
     let models = if let Some(requested) = requested {
         vec![model_by_name(requested).ok_or_else(|| {
             anyhow::anyhow!(
-                "Unknown model '{requested}'. Supported models: tiny, base, small, recommended"
+                "Unknown model '{requested}'. Supported models: {}",
+                supported_model_names()
             )
         })?]
     } else {
@@ -462,16 +463,16 @@ fn verify_models(paths: &AppPaths, requested: Option<&str>) -> Result<()> {
     for model in models {
         let path = paths.model_path(model);
         if !path.exists() {
-            println!("{:<6} missing  {}", model.name, path.display());
+            println!("{:<22} missing  {}", model.name, path.display());
             failed = true;
             continue;
         }
 
         match verify_sha1(&path, model.sha1) {
-            Ok(()) => println!("{:<6} ok       {}", model.name, path.display()),
+            Ok(()) => println!("{:<22} ok       {}", model.name, path.display()),
             Err(error) => {
-                println!("{:<6} corrupt  {}", model.name, path.display());
-                println!("       {error:#}");
+                println!("{:<22} corrupt  {}", model.name, path.display());
+                println!("                       {error:#}");
                 failed = true;
             }
         }
@@ -486,7 +487,8 @@ fn verify_models(paths: &AppPaths, requested: Option<&str>) -> Result<()> {
 fn remove_model(paths: &AppPaths, requested: &str) -> Result<()> {
     let model = model_by_name(requested).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown model '{requested}'. Supported models: tiny, base, small, recommended"
+            "Unknown model '{requested}'. Supported models: {}",
+            supported_model_names()
         )
     })?;
     let path = paths.model_path(model);
@@ -503,7 +505,12 @@ fn effective_config(paths: &AppPaths, args: &LiveArgs) -> Result<UserConfig> {
     let mut config = UserConfig::load_or_create(paths)?;
     if let Some(model) = &args.model {
         config.model = model_by_name(model)
-            .ok_or_else(|| anyhow::anyhow!("Unknown model '{model}'"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unknown model '{model}'. Supported models: {}",
+                    supported_model_names()
+                )
+            })?
             .name
             .to_string();
     }
@@ -560,7 +567,12 @@ fn run_file(args: FileArgs) -> Result<()> {
     let mut config = UserConfig::load_or_create(&paths)?;
     if let Some(model) = &args.model {
         config.model = model_by_name(model)
-            .ok_or_else(|| anyhow::anyhow!("Unknown model '{model}'"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unknown model '{model}'. Supported models: {}",
+                    supported_model_names()
+                )
+            })?
             .name
             .to_string();
     }
@@ -764,7 +776,7 @@ fn run_live_tui(
 
         if event::poll(tick_rate)? {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if should_handle_key_event(key) => {
                     if let Some(outcome) = handle_live_key(key, &mut ui) {
                         stop_session(&mut ui);
                         return Ok(outcome);
@@ -776,7 +788,11 @@ fn run_live_tui(
                         return Ok(outcome);
                     }
                 }
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                Event::Key(_)
+                | Event::Resize(_, _)
+                | Event::FocusGained
+                | Event::FocusLost
+                | Event::Paste(_) => {}
             }
         }
     }
@@ -910,12 +926,20 @@ fn handle_live_key(key: KeyEvent, ui: &mut LiveUi) -> Option<LiveOutcome> {
             }
             None
         }
-        KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
-            focus_next(ui);
+        KeyCode::Tab => {
+            focus_next(ui, true);
             None
         }
-        KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
-            focus_prev(ui);
+        KeyCode::Down | KeyCode::Right => {
+            focus_next(ui, false);
+            None
+        }
+        KeyCode::BackTab => {
+            focus_prev(ui, true);
+            None
+        }
+        KeyCode::Up | KeyCode::Left => {
+            focus_prev(ui, false);
             None
         }
         KeyCode::Enter => activate_live_focused(ui),
@@ -1301,7 +1325,8 @@ fn config_set(key: &str, value: &str) -> Result<()> {
         "model" => {
             let model = model_by_name(value).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Unknown model '{value}'. Supported models: tiny, base, small, recommended"
+                    "Unknown model '{value}'. Supported models: {}",
+                    supported_model_names()
                 )
             })?;
             config.model = model.name.to_string();
@@ -1396,7 +1421,7 @@ fn run_config_tui(paths: AppPaths, config: UserConfig) -> Result<ConfigOutcome> 
         terminal.draw(|frame| render_config(frame, &mut ui))?;
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => {
+                Event::Key(key) if should_handle_key_event(key) => {
                     if let Some(outcome) = handle_config_key(key, &mut ui)? {
                         return Ok(outcome);
                     }
@@ -1406,7 +1431,11 @@ fn run_config_tui(paths: AppPaths, config: UserConfig) -> Result<ConfigOutcome> 
                         return Ok(outcome);
                     }
                 }
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                Event::Key(_)
+                | Event::Resize(_, _)
+                | Event::FocusGained
+                | Event::FocusLost
+                | Event::Paste(_) => {}
             }
         }
     }
@@ -1436,12 +1465,20 @@ fn handle_config_key(key: KeyEvent, ui: &mut ConfigUi) -> Result<Option<ConfigOu
             ui.message = "Settings saved.".to_string();
             Ok(None)
         }
-        KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
-            focus_next_config(ui);
+        KeyCode::Tab => {
+            focus_next_config(ui, true);
             Ok(None)
         }
-        KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
-            focus_prev_config(ui);
+        KeyCode::Down | KeyCode::Right => {
+            focus_next_config(ui, false);
+            Ok(None)
+        }
+        KeyCode::BackTab => {
+            focus_prev_config(ui, true);
+            Ok(None)
+        }
+        KeyCode::Up | KeyCode::Left => {
+            focus_prev_config(ui, false);
             Ok(None)
         }
         KeyCode::Enter => activate_config_focused(ui),
@@ -1914,22 +1951,16 @@ fn parse_transcript_format(value: &str) -> std::result::Result<TranscriptFormat,
         .ok_or_else(|| "expected one of: md, txt, srt, json, jsonl".to_string())
 }
 
-fn focus_next(ui: &mut LiveUi) {
-    if ui.targets.is_empty() {
-        return;
-    }
-    ui.focused = (ui.focused + 1) % ui.targets.len();
+fn should_handle_key_event(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
 }
 
-fn focus_prev(ui: &mut LiveUi) {
-    if ui.targets.is_empty() {
-        return;
-    }
-    ui.focused = if ui.focused == 0 {
-        ui.targets.len() - 1
-    } else {
-        ui.focused - 1
-    };
+fn focus_next(ui: &mut LiveUi, wrap: bool) {
+    focus_next_target(&ui.targets, &mut ui.focused, wrap);
+}
+
+fn focus_prev(ui: &mut LiveUi, wrap: bool) {
+    focus_prev_target(&ui.targets, &mut ui.focused, wrap);
 }
 
 fn clamp_focus(ui: &mut LiveUi) {
@@ -1940,22 +1971,12 @@ fn clamp_focus(ui: &mut LiveUi) {
     }
 }
 
-fn focus_next_config(ui: &mut ConfigUi) {
-    if ui.targets.is_empty() {
-        return;
-    }
-    ui.focused = (ui.focused + 1) % ui.targets.len();
+fn focus_next_config(ui: &mut ConfigUi, wrap: bool) {
+    focus_next_target(&ui.targets, &mut ui.focused, wrap);
 }
 
-fn focus_prev_config(ui: &mut ConfigUi) {
-    if ui.targets.is_empty() {
-        return;
-    }
-    ui.focused = if ui.focused == 0 {
-        ui.targets.len() - 1
-    } else {
-        ui.focused - 1
-    };
+fn focus_prev_config(ui: &mut ConfigUi, wrap: bool) {
+    focus_prev_target(&ui.targets, &mut ui.focused, wrap);
 }
 
 fn clamp_focus_config(ui: &mut ConfigUi) {
@@ -1964,6 +1985,50 @@ fn clamp_focus_config(ui: &mut ConfigUi) {
     } else if ui.focused >= ui.targets.len() {
         ui.focused = ui.targets.len() - 1;
     }
+}
+
+fn focus_next_target(targets: &[MouseTarget], focused: &mut usize, wrap: bool) {
+    let ids = focusable_target_ids(targets);
+    if ids.is_empty() {
+        *focused = 0;
+        return;
+    }
+
+    let current = ids.iter().position(|id| id == focused).unwrap_or(0);
+    let next = if current + 1 < ids.len() {
+        current + 1
+    } else if wrap {
+        0
+    } else {
+        current
+    };
+    *focused = ids[next];
+}
+
+fn focus_prev_target(targets: &[MouseTarget], focused: &mut usize, wrap: bool) {
+    let ids = focusable_target_ids(targets);
+    if ids.is_empty() {
+        *focused = 0;
+        return;
+    }
+
+    let current = ids.iter().position(|id| id == focused).unwrap_or(0);
+    let next = if current > 0 {
+        current - 1
+    } else if wrap {
+        ids.len() - 1
+    } else {
+        current
+    };
+    *focused = ids[next];
+}
+
+fn focusable_target_ids(targets: &[MouseTarget]) -> Vec<usize> {
+    targets
+        .iter()
+        .filter(|target| target.enabled)
+        .map(|target| target.id)
+        .collect()
 }
 
 fn button(
@@ -2106,5 +2171,55 @@ mod tests {
                 .command,
             Some(Commands::Config(_))
         ));
+    }
+
+    #[test]
+    fn tui_ignores_key_release_and_repeat_events() {
+        assert!(should_handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Up,
+            KeyModifiers::empty(),
+            KeyEventKind::Press,
+        )));
+        assert!(!should_handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Up,
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        )));
+        assert!(!should_handle_key_event(KeyEvent::new_with_kind(
+            KeyCode::Up,
+            KeyModifiers::empty(),
+            KeyEventKind::Repeat,
+        )));
+    }
+
+    #[test]
+    fn focus_arrows_do_not_wrap_or_assume_dense_ids() {
+        let targets = vec![
+            MouseTarget {
+                id: 10,
+                area: Rect::new(0, 0, 1, 1),
+                enabled: true,
+                action: TargetAction::Live(LiveAction::Quit),
+            },
+            MouseTarget {
+                id: 30,
+                area: Rect::new(0, 1, 1, 1),
+                enabled: true,
+                action: TargetAction::Live(LiveAction::Quit),
+            },
+        ];
+        let mut focused = 10;
+
+        focus_prev_target(&targets, &mut focused, false);
+        assert_eq!(focused, 10);
+
+        focus_next_target(&targets, &mut focused, false);
+        assert_eq!(focused, 30);
+
+        focus_next_target(&targets, &mut focused, false);
+        assert_eq!(focused, 30);
+
+        focus_next_target(&targets, &mut focused, true);
+        assert_eq!(focused, 10);
     }
 }

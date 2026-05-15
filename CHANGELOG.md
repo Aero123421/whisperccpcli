@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.2
+
+- Added `large-v3-turbo-q5_0` model support and made `recommended` resolve to that model.
+- Fixed TUI keyboard handling so release/repeat events do not move focus multiple times.
+- Made arrow-key focus movement stop at list edges instead of wrapping unexpectedly.
+
 ## v0.3.1
 
 - Split microphone capture/segmentation from Whisper inference so slow transcription no longer blocks audio queue draining.
