@@ -51,8 +51,16 @@ whispercli models list
 
 ## Run
 
+Installed binary:
+
 ```powershell
-cargo run -- live --out meeting.md --model tiny --lang ja
+whispercli
+```
+
+With options:
+
+```powershell
+whispercli live --out meeting.md --model tiny --lang ja
 ```
 
 終了:
@@ -61,12 +69,21 @@ cargo run -- live --out meeting.md --model tiny --lang ja
 q / Esc / Ctrl+C
 ```
 
+Mouse:
+
+```text
+Click Install model / Quit buttons in the TUI.
+```
+
 ## MVP scope
 
 - リッチTUI
 - レスポンシブレイアウト
-- ライブ文字起こし画面の骨格
-- 保存先、モデル、言語、音量、タイムラインの表示
+- `whispercli` だけで起動
+- モデル未導入時のセットアップ画面
+- デモ文字起こし・ダミー音量表示なし
+- マウスクリック操作
+- 保存先、モデル、言語、状態の表示
 - `~/.whispercli` の自動作成
 - `tiny` / `base` モデルのダウンロードとSHA1検証
 - GitHub ActionsによるCI/CD

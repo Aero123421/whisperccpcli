@@ -9,10 +9,13 @@
 - Model state was only visual. `whispercli models install tiny|base` now downloads ggml models and verifies SHA1 from the whisper.cpp model table.
 - Errors were mostly raw `?` propagation. The current code adds context around filesystem, terminal, download, checksum, and PATH setup failures.
 - Distribution was undefined. CI, release packaging, npm wrapper, and Windows installer scripts are now present.
+- The TUI no longer shows fake transcript text, fake microphone devices, fake audio levels, or advertised shortcuts that do not exist.
+- `whispercli` with no subcommand now opens the TUI.
+- Mouse capture is enabled for the TUI, with clickable setup and quit actions.
 
 ### Remaining engineering risks
 
-- The current live screen is still a simulated transcript. `cpal` audio input and `whisper-rs` inference are the next core implementation step.
+- The current live screen is an honest setup/readiness screen. `cpal` audio input and `whisper-rs` inference are the next core implementation step before real transcription can appear.
 - `cargo check` could not be run on the local machine because Rust is not installed in PATH.
 - `Cargo.lock` is not generated yet for the same reason. It should be committed after the first successful local or CI build.
 

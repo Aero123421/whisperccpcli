@@ -1,6 +1,6 @@
 {
   "name": "whisperccpcli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lightweight local Whisper CLI with a calm real-time TUI.",
   "bin": {
     "whispercli": "bin/whispercli.js",

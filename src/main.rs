@@ -10,7 +10,10 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,9 +21,8 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     prelude::{Backend, CrosstermBackend, Frame, Terminal},
     style::{Color, Modifier, Style},
-    symbols,
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use sha1::{Digest, Sha1};
 
@@ -32,12 +34,12 @@ const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resol
 #[command(about = "Lightweight local Whisper transcription CLI")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Start the real-time transcription TUI.
+    /// Start the transcription TUI.
     Live(LiveArgs),
     /// Create user directories and print install diagnostics.
     Init(InitArgs),
@@ -63,6 +65,16 @@ struct LiveArgs {
     /// Recognition language.
     #[arg(long, default_value = "ja")]
     lang: String,
+}
+
+impl Default for LiveArgs {
+    fn default() -> Self {
+        Self {
+            out: "meeting.md".to_string(),
+            model: "tiny".to_string(),
+            lang: "ja".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -139,40 +151,66 @@ impl AppPaths {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenMode {
+    SetupRequired,
+    EnginePending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseAction {
+    InstallModel,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MouseTarget {
+    area: Rect,
+    action: MouseAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    Quit,
+    InstallModel,
+}
+
 #[derive(Debug)]
 struct App {
     args: LiveArgs,
     paths: AppPaths,
     started_at: Instant,
-    level: u16,
-    tick: u64,
-    waveform: Vec<u64>,
     running: bool,
-    model_status: String,
+    outcome: RunOutcome,
+    screen_mode: ScreenMode,
+    selected_model: ModelInfo,
+    mouse_targets: Vec<MouseTarget>,
 }
 
 impl App {
-    fn new(args: LiveArgs, paths: AppPaths) -> Self {
-        let model_status = model_by_name(&args.model)
-            .map(|model| {
-                if paths.models.join(model.file_name).exists() {
-                    "installed".to_string()
-                } else {
-                    "missing".to_string()
-                }
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+    fn new(args: LiveArgs, paths: AppPaths) -> Result<Self> {
+        let selected_model = model_by_name(&args.model).ok_or_else(|| {
+            anyhow!(
+                "Unknown model '{}'. Supported models: tiny, base",
+                args.model
+            )
+        })?;
+        let screen_mode = if paths.models.join(selected_model.file_name).exists() {
+            ScreenMode::EnginePending
+        } else {
+            ScreenMode::SetupRequired
+        };
 
-        Self {
+        Ok(Self {
             args,
             paths,
             started_at: Instant::now(),
-            level: 28,
-            tick: 0,
-            waveform: vec![1, 3, 4, 2, 7, 9, 6, 5, 3, 4, 8, 10, 7, 4, 2, 1],
             running: true,
-            model_status,
-        }
+            outcome: RunOutcome::Quit,
+            screen_mode,
+            selected_model,
+            mouse_targets: Vec::new(),
+        })
     }
 
     fn elapsed(&self) -> String {
@@ -180,14 +218,20 @@ impl App {
         format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
     }
 
-    fn on_tick(&mut self) {
-        self.tick = self.tick.wrapping_add(1);
-        let phase = self.tick % 32;
-        self.level = 18 + ((phase * 7 + phase.pow(2)) % 58) as u16;
+    fn request_install(&mut self) {
+        if self.screen_mode == ScreenMode::SetupRequired {
+            self.outcome = RunOutcome::InstallModel;
+            self.running = false;
+        }
+    }
 
-        let next = 1 + ((self.tick * 5 + self.tick.pow(2)) % 10);
-        self.waveform.remove(0);
-        self.waveform.push(next);
+    fn quit(&mut self) {
+        self.outcome = RunOutcome::Quit;
+        self.running = false;
+    }
+
+    fn set_mouse_targets(&mut self, targets: Vec<MouseTarget>) {
+        self.mouse_targets = targets;
     }
 }
 
@@ -196,8 +240,8 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("Failed to enable terminal raw mode")?;
-        execute!(io::stdout(), EnterAlternateScreen)
-            .context("Failed to enter alternate terminal screen")?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+            .context("Failed to enter terminal UI mode")?;
         Ok(Self)
     }
 }
@@ -205,7 +249,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -220,10 +264,11 @@ fn try_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Live(args) => run_tui(args),
-        Commands::Init(args) => init(args),
-        Commands::Doctor => doctor(),
-        Commands::Models { command } => models(command),
+        Some(Commands::Live(args)) => run_tui(args),
+        Some(Commands::Init(args)) => init(args),
+        Some(Commands::Doctor) => doctor(),
+        Some(Commands::Models { command }) => models(command),
+        None => run_tui(LiveArgs::default()),
     }
 }
 
@@ -268,7 +313,11 @@ fn models(command: ModelCommand) -> Result<()> {
         ModelCommand::List => {
             for model in MODELS {
                 let path = paths.models.join(model.file_name);
-                let state = if path.exists() { "installed" } else { "available" };
+                let state = if path.exists() {
+                    "installed"
+                } else {
+                    "available"
+                };
                 println!(
                     "{:<6} {:<10} {:<10} {}",
                     model.name,
@@ -284,14 +333,17 @@ fn models(command: ModelCommand) -> Result<()> {
 }
 
 fn install_model(paths: &AppPaths, requested: &str) -> Result<()> {
-    let model = model_by_name(requested).ok_or_else(|| {
-        anyhow!("Unknown model '{requested}'. Supported models: tiny, base")
-    })?;
+    let model = model_by_name(requested)
+        .ok_or_else(|| anyhow!("Unknown model '{requested}'. Supported models: tiny, base"))?;
     let target = paths.models.join(model.file_name);
     if target.exists() {
         verify_sha1(&target, model.sha1)
             .with_context(|| format!("Installed model is corrupt: {}", target.display()))?;
-        println!("model '{}' already installed at {}", model.name, target.display());
+        println!(
+            "model '{}' already installed at {}",
+            model.name,
+            target.display()
+        );
         return Ok(());
     }
 
@@ -304,14 +356,13 @@ fn install_model(paths: &AppPaths, requested: &str) -> Result<()> {
         .with_context(|| format!("Failed to start download from {url}"))?
         .error_for_status()
         .with_context(|| format!("Model server returned an error for {url}"))?;
-    let mut file = File::create(&temp)
-        .with_context(|| format!("Failed to create {}", temp.display()))?;
+    let mut file =
+        File::create(&temp).with_context(|| format!("Failed to create {}", temp.display()))?;
     io::copy(&mut response, &mut file)
         .with_context(|| format!("Failed to write {}", temp.display()))?;
     file.flush()?;
 
-    verify_sha1(&temp, model.sha1)
-        .with_context(|| "Downloaded model checksum did not match")?;
+    verify_sha1(&temp, model.sha1).with_context(|| "Downloaded model checksum did not match")?;
     fs::rename(&temp, &target)
         .with_context(|| format!("Failed to move model into {}", target.display()))?;
 
@@ -341,41 +392,76 @@ fn run_tui(args: LiveArgs) -> Result<()> {
     let paths = AppPaths::new()?;
     paths.ensure()?;
 
-    let _guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).context("Failed to create terminal backend")?;
-    let result = run_app(&mut terminal, App::new(args, paths));
-    terminal.show_cursor().ok();
-    result
-}
+    let outcome = {
+        let _guard = TerminalGuard::enter()?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).context("Failed to create terminal backend")?;
+        let outcome = run_app(&mut terminal, App::new(args.clone(), paths)?)?;
+        terminal.show_cursor().ok();
+        outcome
+    };
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
-    let tick_rate = Duration::from_millis(250);
-
-    while app.running {
-        terminal.draw(|frame| render(frame, &app))?;
-
-        if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
-                handle_key(key, &mut app);
-            }
-        }
-
-        app.on_tick();
+    if outcome == RunOutcome::InstallModel {
+        let paths = AppPaths::new()?;
+        paths.ensure()?;
+        install_model(&paths, &args.model)?;
+        println!();
+        println!("model installed. Run `whispercli` to return to the TUI.");
     }
 
     Ok(())
 }
 
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<RunOutcome> {
+    let tick_rate = Duration::from_millis(250);
+
+    while app.running {
+        terminal.draw(|frame| render(frame, &mut app))?;
+
+        if event::poll(tick_rate)? {
+            match event::read()? {
+                Event::Key(key) => handle_key(key, &mut app),
+                Event::Mouse(mouse) => handle_mouse(mouse, &mut app),
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+            }
+        }
+    }
+
+    Ok(app.outcome)
+}
+
 fn handle_key(key: KeyEvent, app: &mut App) {
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.running = false,
-        KeyCode::Char('q') | KeyCode::Esc => app.running = false,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.quit(),
+        KeyCode::Char('q') | KeyCode::Esc => app.quit(),
+        KeyCode::Char('i') => app.request_install(),
         _ => {}
     }
 }
 
-fn render(frame: &mut Frame<'_>, app: &App) {
+fn handle_mouse(mouse: MouseEvent, app: &mut App) {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return;
+    }
+
+    let action = app
+        .mouse_targets
+        .iter()
+        .find(|target| contains(target.area, mouse.column, mouse.row))
+        .map(|target| target.action);
+
+    match action {
+        Some(MouseAction::InstallModel) => app.request_install(),
+        Some(MouseAction::Quit) => app.quit(),
+        None => {}
+    }
+}
+
+fn contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+}
+
+fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let shell = Layout::default()
         .direction(Direction::Vertical)
@@ -387,57 +473,84 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         .split(area);
 
     frame.render_widget(header(app), shell[0]);
-    render_body(frame, app, shell[1]);
-    frame.render_widget(commands(), shell[2]);
+    let targets = render_body(frame, app, shell[1]);
+    frame.render_widget(commands(app), shell[2]);
+    app.set_mouse_targets(targets);
 }
 
-fn render_body(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if area.width >= 104 && area.height >= 20 {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(area);
-
-        frame.render_widget(transcript(), columns[0]);
-
-        let right = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(9),
-                Constraint::Length(6),
-                Constraint::Min(5),
-            ])
-            .split(columns[1]);
-
-        frame.render_widget(session(app), right[0]);
-        frame.render_widget(audio(app), right[1]);
-        frame.render_widget(timeline(app), right[2]);
-    } else {
-        let rows = if area.height >= 22 {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(8),
-                    Constraint::Length(6),
-                    Constraint::Length(5),
-                ])
-                .split(area)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(6), Constraint::Length(5)])
-                .split(area)
-        };
-
-        frame.render_widget(transcript(), rows[0]);
-
-        if rows.len() == 3 {
-            frame.render_widget(session(app), rows[1]);
-            frame.render_widget(audio(app), rows[2]);
-        } else {
-            frame.render_widget(compact_status(app), rows[1]);
-        }
+fn render_body(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarget> {
+    match app.screen_mode {
+        ScreenMode::SetupRequired => render_setup(frame, app, area),
+        ScreenMode::EnginePending => render_engine_pending(frame, app, area),
     }
+}
+
+fn render_setup(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarget> {
+    let chunks = if area.width >= 94 && area.height >= 16 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(9), Constraint::Length(7)])
+            .split(area)
+    };
+
+    frame.render_widget(setup_message(app), chunks[0]);
+    render_actions(frame, app, chunks[1])
+}
+
+fn render_engine_pending(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarget> {
+    let chunks = if area.width >= 104 && area.height >= 18 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(9), Constraint::Length(8)])
+            .split(area)
+    };
+
+    frame.render_widget(engine_message(app), chunks[0]);
+    render_actions(frame, app, chunks[1])
+}
+
+fn render_actions(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarget> {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    frame.render_widget(session(app), rows[0]);
+
+    let mut targets = Vec::new();
+    if app.screen_mode == ScreenMode::SetupRequired {
+        frame.render_widget(
+            button("Install model", "click or press i"),
+            rows[1],
+        );
+        targets.push(MouseTarget {
+            area: rows[1],
+            action: MouseAction::InstallModel,
+        });
+    } else {
+        frame.render_widget(button("Waiting", "audio engine pending"), rows[1]);
+    }
+
+    frame.render_widget(button("Quit", "click or press q"), rows[2]);
+    targets.push(MouseTarget {
+        area: rows[2],
+        action: MouseAction::Quit,
+    });
+    targets
 }
 
 fn header(app: &App) -> Paragraph<'_> {
@@ -447,7 +560,10 @@ fn header(app: &App) -> Paragraph<'_> {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     );
-    let rec = Span::styled(" REC ", Style::default().fg(Color::Gray));
+    let state = match app.screen_mode {
+        ScreenMode::SetupRequired => " SETUP ",
+        ScreenMode::EnginePending => " ENGINE PENDING ",
+    };
     let meta = Span::styled(
         format!(
             " {}   model {}   lang {}   out {}",
@@ -459,21 +575,61 @@ fn header(app: &App) -> Paragraph<'_> {
         Style::default().fg(Color::Gray),
     );
 
-    Paragraph::new(Line::from(vec![title, rec, meta]))
-        .block(base_block())
-        .alignment(Alignment::Left)
+    Paragraph::new(Line::from(vec![
+        title,
+        Span::styled(state, Style::default().fg(Color::Gray)),
+        meta,
+    ]))
+    .block(base_block())
+    .alignment(Alignment::Left)
 }
 
-fn transcript() -> Paragraph<'static> {
+fn setup_message(app: &App) -> Paragraph<'_> {
     let lines = vec![
-        Line::from("今日はRustで軽量な文字起こしCLIを作る話をしています。"),
-        Line::from("whisper.cppを使って、オフラインでもリアルタイムに保存できます。"),
-        Line::from("まずはTUIの見た目と操作感を固めて、あとから音声入力を接続します。"),
-        Line::from(""),
         Line::from(Span::styled(
-            "listening...",
-            Style::default().fg(Color::DarkGray),
+            "Model is not installed",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )),
+        Line::from(""),
+        Line::from("whisperCLI will not show fake transcript text or simulated audio."),
+        Line::from("Install a local whisper.cpp model before starting transcription."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Recommended: ", muted()),
+            Span::raw(format!(
+                "{} ({})",
+                app.selected_model.name, app.selected_model.size
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Command:     ", muted()),
+            Span::raw(format!("whispercli models install {}", app.args.model)),
+        ]),
+    ];
+
+    Paragraph::new(lines)
+        .block(base_block().title(" Setup "))
+        .wrap(Wrap { trim: false })
+}
+
+fn engine_message(app: &App) -> Paragraph<'_> {
+    let lines = vec![
+        Line::from(Span::styled(
+            "Ready for the audio engine implementation",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("No transcript is shown until real microphone input and whisper.cpp decoding are connected."),
+        Line::from("The model is installed, so the next implementation step is cpal input + whisper-rs streaming."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Output path: ", muted()),
+            Span::raw(app.args.out.as_str()),
+        ]),
     ];
 
     Paragraph::new(lines)
@@ -482,19 +638,18 @@ fn transcript() -> Paragraph<'static> {
 }
 
 fn session(app: &App) -> Paragraph<'_> {
+    let model_path = app.paths.models.join(app.selected_model.file_name);
+    let model_state = if model_path.exists() {
+        "installed"
+    } else {
+        "missing"
+    };
     let rows = vec![
-        Line::from(vec![
-            Span::styled("device ", muted()),
-            Span::raw("Microphone Array"),
-        ]),
         Line::from(vec![
             Span::styled("model  ", muted()),
             Span::raw(app.args.model.as_str()),
         ]),
-        Line::from(vec![
-            Span::styled("status ", muted()),
-            Span::raw(app.model_status.as_str()),
-        ]),
+        Line::from(vec![Span::styled("state  ", muted()), Span::raw(model_state)]),
         Line::from(vec![
             Span::styled("lang   ", muted()),
             Span::raw(app.args.lang.as_str()),
@@ -505,7 +660,7 @@ fn session(app: &App) -> Paragraph<'_> {
         ]),
         Line::from(vec![
             Span::styled("home   ", muted()),
-            Span::raw(app.paths.root.display().to_string()),
+            Span::raw(short_home_path(&app.paths.root)),
         ]),
     ];
 
@@ -514,49 +669,26 @@ fn session(app: &App) -> Paragraph<'_> {
         .wrap(Wrap { trim: true })
 }
 
-fn audio(app: &App) -> Gauge<'_> {
-    Gauge::default()
-        .block(base_block().title(" Audio "))
-        .gauge_style(Style::default().fg(Color::Gray).bg(Color::Black))
-        .ratio(app.level as f64 / 100.0)
-        .label(format!("level {:02}%", app.level))
+fn button(label: &'static str, hint: &'static str) -> Paragraph<'static> {
+    Paragraph::new(Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {hint}"), muted()),
+    ]))
+    .block(base_block())
+    .alignment(Alignment::Center)
 }
 
-fn timeline(app: &App) -> Sparkline<'_> {
-    Sparkline::default()
-        .block(base_block().title(" Timeline "))
-        .data(&app.waveform)
-        .style(Style::default().fg(Color::Gray))
-        .bar_set(symbols::bar::NINE_LEVELS)
-}
+fn commands(app: &App) -> Paragraph<'static> {
+    let line = match app.screen_mode {
+        ScreenMode::SetupRequired => "Commands  i install model   q/Esc/Ctrl+C quit   mouse click supported",
+        ScreenMode::EnginePending => {
+            "Commands  q/Esc/Ctrl+C quit   mouse click supported   no fake transcript"
+        }
+    };
 
-fn compact_status(app: &App) -> Paragraph<'_> {
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Audio ", muted()),
-            Span::raw(format!("level {:02}%   ", app.level)),
-            Span::styled("model ", muted()),
-            Span::raw(format!("{} ({})", app.args.model, app.model_status)),
-        ]),
-        Line::from(vec![
-            Span::styled("output ", muted()),
-            Span::raw(app.args.out.as_str()),
-            Span::raw("   "),
-            Span::styled("home ", muted()),
-            Span::raw(app.paths.root.display().to_string()),
-        ]),
-    ];
-
-    Paragraph::new(lines)
-        .block(base_block().title(" Status "))
-        .wrap(Wrap { trim: true })
-}
-
-fn commands() -> Paragraph<'static> {
     Paragraph::new(Line::from(vec![
         Span::styled("Commands  ", muted()),
-        Span::raw("Ctrl+S save   Ctrl+P pause   Ctrl+M model   "),
-        Span::styled("q/Esc/Ctrl+C finish", Style::default().fg(Color::White)),
+        Span::raw(line.trim_start_matches("Commands  ")),
     ]))
     .block(base_block())
     .wrap(Wrap { trim: true })
@@ -572,6 +704,24 @@ fn muted() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+fn short_home_path(path: &Path) -> String {
+    let home = match home_dir() {
+        Ok(home) => home,
+        Err(_) => return path.display().to_string(),
+    };
+
+    if let Ok(stripped) = path.strip_prefix(home) {
+        let rest = stripped.display().to_string();
+        if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~\\{}", rest.trim_start_matches(['\\', '/']))
+        }
+    } else {
+        path.display().to_string()
+    }
+}
+
 fn home_dir() -> Result<PathBuf> {
     env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
@@ -582,7 +732,10 @@ fn home_dir() -> Result<PathBuf> {
 fn add_current_exe_dir_to_path() -> Result<()> {
     if env::consts::OS != "windows" {
         println!("--add-to-path is currently implemented for Windows only.");
-        println!("Add this directory to PATH manually: {}", current_exe_dir()?.display());
+        println!(
+            "Add this directory to PATH manually: {}",
+            current_exe_dir()?.display()
+        );
         return Ok(());
     }
 
