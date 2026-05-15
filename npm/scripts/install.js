@@ -55,14 +55,13 @@ function extract(archive, destination) {
   fs.mkdirSync(destination, { recursive: true });
 
   if (archive.endsWith(".zip")) {
+    const psQuote = (value) => `'${value.replace(/'/g, "''")}'`;
     execFileSync("powershell", [
       "-NoProfile",
       "-ExecutionPolicy",
       "Bypass",
       "-Command",
-      "Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force",
-      archive,
-      destination,
+      `Expand-Archive -LiteralPath ${psQuote(archive)} -DestinationPath ${psQuote(destination)} -Force`,
     ], { stdio: "inherit" });
     return;
   }
