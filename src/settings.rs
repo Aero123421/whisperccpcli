@@ -73,8 +73,70 @@ pub struct UserConfig {
     pub output_dir: PathBuf,
     pub output_format: TranscriptFormat,
     pub chunk_seconds: u64,
+    #[serde(default)]
+    pub latency_mode: LatencyMode,
     pub threads: usize,
     pub start_paused: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LatencyMode {
+    Fast,
+    #[default]
+    Balanced,
+    Accurate,
+}
+
+impl LatencyMode {
+    pub fn all() -> &'static [LatencyMode] {
+        &[
+            LatencyMode::Fast,
+            LatencyMode::Balanced,
+            LatencyMode::Accurate,
+        ]
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fast" => Some(Self::Fast),
+            "balanced" | "balance" => Some(Self::Balanced),
+            "accurate" | "quality" => Some(Self::Accurate),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::Accurate => "accurate",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Accurate => "Accurate",
+        }
+    }
+
+    pub fn window_seconds(self) -> u64 {
+        match self {
+            Self::Fast => 6,
+            Self::Balanced => 8,
+            Self::Accurate => 12,
+        }
+    }
+
+    pub fn step_seconds(self) -> u64 {
+        match self {
+            Self::Fast => 1,
+            Self::Balanced => 2,
+            Self::Accurate => 3,
+        }
+    }
 }
 
 impl UserConfig {
@@ -88,6 +150,7 @@ impl UserConfig {
                 .unwrap_or_else(|| paths.transcripts.clone()),
             output_format: TranscriptFormat::Md,
             chunk_seconds: 5,
+            latency_mode: LatencyMode::Balanced,
             threads: std::thread::available_parallelism()
                 .map(|threads| threads.get().clamp(1, 8))
                 .unwrap_or(4),
@@ -171,7 +234,16 @@ mod tests {
 
         let config = config.normalized();
         assert_eq!(config.chunk_seconds, 2);
+        assert_eq!(config.latency_mode, LatencyMode::Balanced);
         assert_eq!(config.threads, 1);
         assert_eq!(config.microphone, None);
+    }
+
+    #[test]
+    fn latency_mode_parser_accepts_expected_values() {
+        assert_eq!(LatencyMode::parse("fast"), Some(LatencyMode::Fast));
+        assert_eq!(LatencyMode::parse("balanced"), Some(LatencyMode::Balanced));
+        assert_eq!(LatencyMode::parse("quality"), Some(LatencyMode::Accurate));
+        assert_eq!(LatencyMode::parse("nope"), None);
     }
 }

@@ -80,7 +80,7 @@ With options:
 
 ```powershell
 whispercli live --out meeting.md --model tiny --lang ja
-whispercli live --out meeting.md --model large-v3-turbo-q5_0 --lang ja
+whispercli live --out meeting.md --model large-v3-turbo-q5_0 --lang ja --latency balanced
 whispercli live --plain --format txt --out meeting.txt
 whispercli live --jsonl --out live.jsonl
 whispercli file audio.wav --format srt --out transcript.srt
@@ -88,6 +88,8 @@ whispercli file audio.wav --format srt --out transcript.srt
 
 日本語の安定性を優先する場合は、`tiny` より `large-v3-turbo-q5_0` を推奨します。
 `recommended` は `large-v3-turbo-q5_0` の別名です。
+live transcription はデフォルトで `balanced` latency mode を使い、8秒のrolling windowを2秒ごとに推論します。
+低遅延なら `--latency fast`、文脈重視なら `--latency accurate` を指定できます。
 
 終了:
 
@@ -109,9 +111,10 @@ Click Install model / Quit buttons in the TUI.
 - `whispercli config` でモデル、マイク、保存先、保存形式を変更
 - マウスホバー、フォーカス、選択状態の表示
 - `cpal` によるマイク入力
-- `whisper-rs` / `whisper.cpp` によるチャンク文字起こし
+- `whisper-rs` / `whisper.cpp` によるrolling window文字起こし
+- 軽量VAD、overlap、重複除去、推論backlog保護
 - Markdown / Text / SRT / JSON / JSONL への逐次保存
-- 保存先、モデル、言語、状態、入力レベル、音声drop数の表示
+- 保存先、モデル、言語、latency、状態、入力レベル、音声/推論drop数の表示
 - `~/.whispercli` の自動作成
 - `tiny` / `base` / `small` / `large-v3-turbo-q5_0` モデルのダウンロード、SHA1検証、verify/remove
 - `doctor --json`、`config get/set`、`live --plain`、WAVファイル文字起こし
@@ -122,7 +125,7 @@ Click Install model / Quit buttons in the TUI.
 
 ## Later
 
-- 重複除去とVADの精度改善
+- VAD・dedupeの実音声チューニング
 - Homebrew / Scoop / winget
 - Linux arm64 / musl binary
 - platform別npm package

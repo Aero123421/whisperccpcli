@@ -25,7 +25,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
 };
-use settings::{TranscriptFormat, UserConfig};
+use settings::{LatencyMode, TranscriptFormat, UserConfig};
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -96,6 +96,10 @@ struct LiveArgs {
     /// Output transcript format: md, txt, srt, json, or jsonl.
     #[arg(long, value_parser = parse_transcript_format)]
     format: Option<TranscriptFormat>,
+
+    /// Live latency mode: fast, balanced, or accurate.
+    #[arg(long, value_parser = parse_latency_mode)]
+    latency: Option<LatencyMode>,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -200,6 +204,7 @@ enum ConfigAction {
     OutputDir(usize),
     Format(usize),
     Language(usize),
+    Latency(usize),
     Back,
     Save,
 }
@@ -350,6 +355,7 @@ fn doctor(args: DoctorArgs) -> Result<()> {
                 "output": config.output_dir.display().to_string(),
                 "format": config.output_format.extension(),
                 "chunk_seconds": config.chunk_seconds,
+                "latency_mode": config.latency_mode.as_str(),
                 "threads": config.threads,
                 "start_paused": config.start_paused,
             },
@@ -382,6 +388,12 @@ fn doctor(args: DoctorArgs) -> Result<()> {
     );
     println!("output      {}", config.output_dir.display());
     println!("format      {}", config.output_format.label());
+    println!(
+        "latency     {} ({}s window / {}s step)",
+        config.latency_mode.as_str(),
+        config.latency_mode.window_seconds(),
+        config.latency_mode.step_seconds()
+    );
     println!();
     println!("models");
     for model in MODELS {
@@ -516,6 +528,9 @@ fn effective_config(paths: &AppPaths, args: &LiveArgs) -> Result<UserConfig> {
     }
     if let Some(lang) = &args.lang {
         config.language = lang.clone();
+    }
+    if let Some(latency_mode) = args.latency {
+        config.latency_mode = latency_mode;
     }
     if let Some(device) = &args.device {
         config.microphone = Some(resolve_device_name(device)?);
@@ -678,6 +693,19 @@ fn run_live_plain(
                     eprintln!("error: {error}");
                 }
             }
+            SessionEvent::InferenceBacklogDropped(total) => {
+                if jsonl {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "backlog",
+                            "dropped_windows": total,
+                        })
+                    );
+                } else {
+                    eprintln!("warning: inference backlog skipped {total} windows");
+                }
+            }
             SessionEvent::Status(SessionStatus::Stopped) => break,
             _ => {}
         }
@@ -704,6 +732,7 @@ struct LiveUi {
     microphone: String,
     level: f32,
     dropped_audio_chunks: u64,
+    dropped_inference_windows: u64,
     paused: bool,
     started_at: Instant,
     message: String,
@@ -748,6 +777,7 @@ fn run_live_tui(
         microphone: "default".to_string(),
         level: 0.0,
         dropped_audio_chunks: 0,
+        dropped_inference_windows: 0,
         paused: start_paused,
         started_at: Instant::now(),
         message: String::new(),
@@ -815,6 +845,10 @@ fn drain_session_events(ui: &mut LiveUi) {
                 SessionEvent::AudioDropped(total) => {
                     ui.dropped_audio_chunks = total;
                     ui.message = format!("Audio queue dropped {total} chunks while busy.");
+                }
+                SessionEvent::InferenceBacklogDropped(total) => {
+                    ui.dropped_inference_windows = total;
+                    ui.message = format!("Inference backlog skipped {total} windows.");
                 }
                 SessionEvent::Saved(path) => {
                     ui.output_path = Some(path.clone());
@@ -1167,8 +1201,15 @@ fn session_panel(ui: &LiveUi) -> Paragraph<'_> {
             Span::raw(ui.config.output_format.label()),
         ]),
         Line::from(vec![
+            Span::styled("latency ", muted()),
+            Span::raw(ui.config.latency_mode.as_str()),
+        ]),
+        Line::from(vec![
             Span::styled("drops  ", muted()),
-            Span::raw(ui.dropped_audio_chunks.to_string()),
+            Span::raw(format!(
+                "audio {} / infer {}",
+                ui.dropped_audio_chunks, ui.dropped_inference_windows
+            )),
         ]),
         Line::from(vec![Span::styled("output ", muted()), Span::raw(output)]),
     ];
@@ -1298,6 +1339,7 @@ fn config_get(key: Option<&str>) -> Result<()> {
         Some("output_dir") | Some("output") => println!("{}", config.output_dir.display()),
         Some("output_format") | Some("format") => println!("{}", config.output_format.extension()),
         Some("chunk_seconds") => println!("{}", config.chunk_seconds),
+        Some("latency_mode") | Some("latency") => println!("{}", config.latency_mode.as_str()),
         Some("threads") => println!("{}", config.threads),
         Some("start_paused") => println!("{}", config.start_paused),
         Some(key) => anyhow::bail!("Unknown config key '{key}'"),
@@ -1311,6 +1353,7 @@ fn config_get(key: Option<&str>) -> Result<()> {
             println!("output_dir={}", config.output_dir.display());
             println!("output_format={}", config.output_format.extension());
             println!("chunk_seconds={}", config.chunk_seconds);
+            println!("latency_mode={}", config.latency_mode.as_str());
             println!("threads={}", config.threads);
             println!("start_paused={}", config.start_paused);
         }
@@ -1345,6 +1388,10 @@ fn config_set(key: &str, value: &str) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Unsupported format '{value}'"))?;
         }
         "chunk_seconds" => config.chunk_seconds = value.parse::<u64>()?.max(2),
+        "latency_mode" | "latency" => {
+            config.latency_mode = LatencyMode::parse(value)
+                .ok_or_else(|| anyhow::anyhow!("Unsupported latency mode '{value}'"))?;
+        }
         "threads" => config.threads = value.parse::<usize>()?.max(1),
         "start_paused" => config.start_paused = parse_bool(value)?,
         _ => anyhow::bail!("Unknown config key '{key}'"),
@@ -1562,6 +1609,13 @@ fn run_config_action(ui: &mut ConfigUi, action: ConfigAction) -> Result<Option<C
                 ui.config.language = language.to_string();
                 ui.config.save(&ui.paths)?;
                 ui.message = format!("Language set to {language}.");
+            }
+        }
+        ConfigAction::Latency(index) => {
+            if let Some(latency_mode) = LatencyMode::all().get(index) {
+                ui.config.latency_mode = *latency_mode;
+                ui.config.save(&ui.paths)?;
+                ui.message = format!("Latency mode set to {}.", latency_mode.label());
             }
         }
         ConfigAction::Save => {
@@ -1861,28 +1915,56 @@ fn render_general_settings(
     id_offset: usize,
 ) -> Vec<MouseTarget> {
     let langs = languages();
-    let item_count = (langs.len() + 2).min(area.height.saturating_div(3).max(1) as usize);
+    let item_count = (langs.len() + LatencyMode::all().len() + 1)
+        .min(area.height.saturating_div(3).max(1) as usize);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(vec![Constraint::Length(3); item_count])
         .split(area);
     let mut targets = Vec::new();
     for (index, language) in langs.iter().enumerate() {
-        if index >= rows.len() {
+        if targets.len() >= rows.len() {
             return targets;
         }
         let id = id_offset + targets.len();
+        let row_index = targets.len();
         let selected = ui.config.language == *language;
         let label = format!("{} language {}", if selected { "●" } else { "○" }, language);
         frame.render_widget(
             selectable_row(&label, selected, ui.hovered == Some(id), ui.focused == id),
-            rows[index],
+            rows[row_index],
         );
         targets.push(MouseTarget {
             id,
-            area: rows[index],
+            area: rows[row_index],
             enabled: true,
             action: TargetAction::Config(ConfigAction::Language(index)),
+        });
+    }
+
+    for (index, latency_mode) in LatencyMode::all().iter().enumerate() {
+        if targets.len() >= rows.len() {
+            return targets;
+        }
+        let id = id_offset + targets.len();
+        let row_index = targets.len();
+        let selected = ui.config.latency_mode == *latency_mode;
+        let label = format!(
+            "{} latency {}   {}s window / {}s step",
+            if selected { "●" } else { "○" },
+            latency_mode.label(),
+            latency_mode.window_seconds(),
+            latency_mode.step_seconds()
+        );
+        frame.render_widget(
+            selectable_row(&label, selected, ui.hovered == Some(id), ui.focused == id),
+            rows[row_index],
+        );
+        targets.push(MouseTarget {
+            id,
+            area: rows[row_index],
+            enabled: true,
+            action: TargetAction::Config(ConfigAction::Latency(index)),
         });
     }
 
@@ -1949,6 +2031,10 @@ fn languages() -> &'static [&'static str] {
 fn parse_transcript_format(value: &str) -> std::result::Result<TranscriptFormat, String> {
     TranscriptFormat::parse(value)
         .ok_or_else(|| "expected one of: md, txt, srt, json, jsonl".to_string())
+}
+
+fn parse_latency_mode(value: &str) -> std::result::Result<LatencyMode, String> {
+    LatencyMode::parse(value).ok_or_else(|| "expected one of: fast, balanced, accurate".to_string())
 }
 
 fn should_handle_key_event(key: KeyEvent) -> bool {
@@ -2137,6 +2223,18 @@ mod tests {
                 assert_eq!(args.format, Some(TranscriptFormat::Txt));
                 assert_eq!(args.device.as_deref(), Some("0"));
                 assert_eq!(args.lang.as_deref(), Some("auto"));
+                assert_eq!(args.latency, None);
+            }
+            _ => panic!("expected live command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_live_latency_mode() {
+        let cli = Cli::try_parse_from(["whispercli", "live", "--latency", "accurate"]).unwrap();
+        match cli.command {
+            Some(Commands::Live(args)) => {
+                assert_eq!(args.latency, Some(LatencyMode::Accurate));
             }
             _ => panic!("expected live command"),
         }

@@ -18,7 +18,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread::{self, JoinHandle},
@@ -30,6 +30,11 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const MIN_TRANSCRIBE_RMS: f32 = 0.006;
 const STOP_FLUSH_MIN_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize;
+const VAD_FRAME_SAMPLES: usize = (WHISPER_SAMPLE_RATE as usize * 30) / 1000;
+const VAD_MIN_SPEECH_SAMPLES: usize = (WHISPER_SAMPLE_RATE as usize * 200) / 1000;
+const VAD_HANGOVER_SAMPLES: usize = (WHISPER_SAMPLE_RATE as usize * 700) / 1000;
+const MAX_QUEUED_WINDOWS: usize = 4;
+const DEDUPE_TAIL_CHARS: usize = 300;
 
 #[derive(Clone, Debug)]
 pub struct TranscriptLine {
@@ -55,6 +60,7 @@ pub enum SessionEvent {
     Microphone(String),
     Segment(TranscriptLine),
     AudioDropped(u64),
+    InferenceBacklogDropped(u64),
     Saved(PathBuf),
     Error(String),
 }
@@ -71,6 +77,137 @@ enum InferenceCommand {
     Transcribe { audio: Vec<f32>, start_sample: u64 },
     SaveNow,
     Stop,
+}
+
+#[derive(Clone, Debug)]
+struct AudioWindow {
+    audio: Vec<f32>,
+    start_sample: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LatencyProfile {
+    window_samples: usize,
+    step_samples: usize,
+}
+
+impl LatencyProfile {
+    fn from_config(config: &UserConfig) -> Self {
+        Self {
+            window_samples: seconds_to_samples(config.latency_mode.window_seconds()),
+            step_samples: seconds_to_samples(config.latency_mode.step_seconds()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VadRegion {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+struct RollingSegmenter {
+    buffer: Vec<f32>,
+    buffer_start_sample: u64,
+    next_emit_end_sample: u64,
+    last_queued_end_sample: u64,
+    profile: LatencyProfile,
+}
+
+impl RollingSegmenter {
+    fn new(profile: LatencyProfile) -> Self {
+        Self {
+            buffer: Vec::with_capacity(profile.window_samples + profile.step_samples),
+            buffer_start_sample: 0,
+            next_emit_end_sample: profile.window_samples as u64,
+            last_queued_end_sample: 0,
+            profile,
+        }
+    }
+
+    fn push(&mut self, samples: &[f32]) -> Vec<AudioWindow> {
+        self.buffer.extend_from_slice(samples);
+        self.ready_windows()
+    }
+
+    fn finish(&mut self) -> Option<AudioWindow> {
+        let stream_end = self.stream_end_sample();
+        if stream_end <= self.last_queued_end_sample {
+            return None;
+        }
+        if stream_end.saturating_sub(self.last_queued_end_sample) < VAD_MIN_SPEECH_SAMPLES as u64 {
+            return None;
+        }
+        let window = self.build_window(stream_end, false);
+        if window.is_some() {
+            self.last_queued_end_sample = stream_end;
+        }
+        window
+    }
+
+    fn ready_windows(&mut self) -> Vec<AudioWindow> {
+        let mut windows = Vec::new();
+        while self.stream_end_sample() >= self.next_emit_end_sample {
+            if let Some(window) = self.build_window(self.next_emit_end_sample, true) {
+                self.last_queued_end_sample = self.next_emit_end_sample;
+                windows.push(window);
+            }
+            self.next_emit_end_sample += self.profile.step_samples as u64;
+        }
+        self.prune();
+        windows
+    }
+
+    fn build_window(&self, end_sample: u64, require_step_speech: bool) -> Option<AudioWindow> {
+        let window_start_sample = end_sample
+            .saturating_sub(self.profile.window_samples as u64)
+            .max(self.buffer_start_sample);
+        let start_index = self.index_for_sample(window_start_sample)?;
+        let end_index = self.index_for_sample(end_sample)?;
+        if end_index <= start_index || end_index - start_index < STOP_FLUSH_MIN_SAMPLES {
+            return None;
+        }
+        let window = &self.buffer[start_index..end_index];
+
+        if require_step_speech {
+            let step_start_sample = end_sample
+                .saturating_sub(self.profile.step_samples as u64)
+                .max(window_start_sample);
+            let step_start_index = self.index_for_sample(step_start_sample)?;
+            detect_speech_region(&self.buffer[step_start_index..end_index])?;
+        }
+
+        let speech = detect_speech_region(window)?;
+        Some(AudioWindow {
+            audio: window.to_vec(),
+            start_sample: window_start_sample + speech.start as u64,
+        })
+    }
+
+    fn prune(&mut self) {
+        let keep_from = self
+            .next_emit_end_sample
+            .saturating_sub(self.profile.window_samples as u64);
+        if keep_from <= self.buffer_start_sample {
+            return;
+        }
+        let remove = (keep_from - self.buffer_start_sample) as usize;
+        let remove = remove.min(self.buffer.len());
+        self.buffer.drain(0..remove);
+        self.buffer_start_sample += remove as u64;
+    }
+
+    fn stream_end_sample(&self) -> u64 {
+        self.buffer_start_sample + self.buffer.len() as u64
+    }
+
+    fn index_for_sample(&self, sample: u64) -> Option<usize> {
+        if sample < self.buffer_start_sample || sample > self.stream_end_sample() {
+            return None;
+        }
+        Some((sample - self.buffer_start_sample) as usize)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -176,7 +313,9 @@ fn run_worker(
         let (inference_tx, inference_rx) = unbounded::<InferenceCommand>();
         let (ready_tx, ready_rx) = bounded(1);
         let paused_state = Arc::new(AtomicBool::new(config.start_paused));
+        let queued_windows = Arc::new(AtomicUsize::new(0));
         let inference_paused_state = paused_state.clone();
+        let inference_queued_windows = queued_windows.clone();
         let inference_paths = paths.clone();
         let inference_config = config.clone();
         let inference_output_path = output_path.clone();
@@ -189,6 +328,7 @@ fn run_worker(
                 inference_rx,
                 inference_event_tx.clone(),
                 inference_paused_state,
+                inference_queued_windows,
                 ready_tx,
             ) {
                 let _ = inference_event_tx.send(SessionEvent::Error(format!("{error:#}")));
@@ -232,10 +372,9 @@ fn run_worker(
             .ok();
 
         let mut paused = config.start_paused;
-        let mut pending = Vec::<f32>::new();
-        let mut pending_start_sample = 0_u64;
+        let mut segmenter = RollingSegmenter::new(LatencyProfile::from_config(&config));
         let mut last_reported_audio_drops = 0_u64;
-        let chunk_samples = (config.chunk_seconds.max(2) as usize) * WHISPER_SAMPLE_RATE as usize;
+        let mut dropped_inference_windows = 0_u64;
 
         event_tx
             .send(SessionEvent::Status(if paused {
@@ -273,18 +412,24 @@ fn run_worker(
                             .ok();
                         capture.take();
                         if !paused {
-                            drain_audio_queue(&audio_rx, &mut pending, source_rate);
+                            drain_audio_queue(
+                                &audio_rx,
+                                &mut segmenter,
+                                source_rate,
+                                &inference_tx,
+                                &queued_windows,
+                                &event_tx,
+                                &mut dropped_inference_windows,
+                            )?;
                         }
-                        queue_ready_chunks(
-                            &mut pending,
-                            &mut pending_start_sample,
-                            chunk_samples,
-                            &inference_tx,
-                        )?;
-                        if pending.len() >= STOP_FLUSH_MIN_SAMPLES {
-                            let audio_chunk = std::mem::take(&mut pending);
-                            let chunk_start_sample = pending_start_sample;
-                            queue_audio_chunk(&inference_tx, audio_chunk, chunk_start_sample)?;
+                        if let Some(window) = segmenter.finish() {
+                            queue_audio_window(
+                                &inference_tx,
+                                &queued_windows,
+                                &event_tx,
+                                &mut dropped_inference_windows,
+                                window,
+                            )?;
                         }
                         inference_tx
                             .send(InferenceCommand::Stop)
@@ -315,19 +460,29 @@ fn run_worker(
                 continue;
             }
 
-            pending.extend(resample_to_16k(&chunk, source_rate));
-            drain_audio_queue(&audio_rx, &mut pending, source_rate);
-            queue_ready_chunks(
-                &mut pending,
-                &mut pending_start_sample,
-                chunk_samples,
+            push_audio_samples(
+                &mut segmenter,
+                &resample_to_16k(&chunk, source_rate),
                 &inference_tx,
+                &queued_windows,
+                &event_tx,
+                &mut dropped_inference_windows,
+            )?;
+            drain_audio_queue(
+                &audio_rx,
+                &mut segmenter,
+                source_rate,
+                &inference_tx,
+                &queued_windows,
+                &event_tx,
+                &mut dropped_inference_windows,
             )?;
         }
     }
 }
 
 #[cfg(feature = "whisper")]
+#[allow(clippy::too_many_arguments)]
 fn run_inference_worker(
     paths: AppPaths,
     config: UserConfig,
@@ -335,6 +490,7 @@ fn run_inference_worker(
     command_rx: Receiver<InferenceCommand>,
     event_tx: Sender<SessionEvent>,
     paused_state: Arc<AtomicBool>,
+    queued_windows: Arc<AtomicUsize>,
     ready_tx: Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
     let model =
@@ -372,7 +528,7 @@ fn run_inference_worker(
                 audio,
                 start_sample,
             } => {
-                process_audio_chunk(
+                let result = process_audio_chunk(
                     &mut state,
                     &config,
                     &output_path,
@@ -382,7 +538,9 @@ fn run_inference_worker(
                     &mut last_text,
                     &audio,
                     start_sample,
-                )?;
+                );
+                queued_windows.fetch_sub(1, Ordering::Relaxed);
+                result?;
                 event_tx
                     .send(SessionEvent::Status(current_session_status(&paused_state)))
                     .ok();
@@ -433,44 +591,83 @@ fn report_audio_drop_stats(
 }
 
 #[cfg(feature = "whisper")]
-fn drain_audio_queue(audio_rx: &Receiver<Vec<f32>>, pending: &mut Vec<f32>, source_rate: u32) {
-    while let Ok(chunk) = audio_rx.try_recv() {
-        pending.extend(resample_to_16k(&chunk, source_rate));
-    }
-}
-
-#[cfg(feature = "whisper")]
-fn queue_ready_chunks(
-    pending: &mut Vec<f32>,
-    pending_start_sample: &mut u64,
-    chunk_samples: usize,
+#[allow(clippy::too_many_arguments)]
+fn drain_audio_queue(
+    audio_rx: &Receiver<Vec<f32>>,
+    segmenter: &mut RollingSegmenter,
+    source_rate: u32,
     inference_tx: &Sender<InferenceCommand>,
+    queued_windows: &AtomicUsize,
+    event_tx: &Sender<SessionEvent>,
+    dropped_inference_windows: &mut u64,
 ) -> Result<()> {
-    while pending.len() >= chunk_samples {
-        let rest = pending.split_off(chunk_samples);
-        let audio_chunk = std::mem::replace(pending, rest);
-        let chunk_start_sample = *pending_start_sample;
-        *pending_start_sample += audio_chunk.len() as u64;
-        queue_audio_chunk(inference_tx, audio_chunk, chunk_start_sample)?;
+    while let Ok(chunk) = audio_rx.try_recv() {
+        push_audio_samples(
+            segmenter,
+            &resample_to_16k(&chunk, source_rate),
+            inference_tx,
+            queued_windows,
+            event_tx,
+            dropped_inference_windows,
+        )?;
     }
     Ok(())
 }
 
 #[cfg(feature = "whisper")]
-fn queue_audio_chunk(
+fn push_audio_samples(
+    segmenter: &mut RollingSegmenter,
+    samples: &[f32],
     inference_tx: &Sender<InferenceCommand>,
-    audio_chunk: Vec<f32>,
-    chunk_start_sample: u64,
+    queued_windows: &AtomicUsize,
+    event_tx: &Sender<SessionEvent>,
+    dropped_inference_windows: &mut u64,
 ) -> Result<()> {
-    if rms(&audio_chunk) < MIN_TRANSCRIBE_RMS {
+    for window in segmenter.push(samples) {
+        queue_audio_window(
+            inference_tx,
+            queued_windows,
+            event_tx,
+            dropped_inference_windows,
+            window,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whisper")]
+fn queue_audio_window(
+    inference_tx: &Sender<InferenceCommand>,
+    queued_windows: &AtomicUsize,
+    event_tx: &Sender<SessionEvent>,
+    dropped_inference_windows: &mut u64,
+    window: AudioWindow,
+) -> Result<()> {
+    if rms(&window.audio) < MIN_TRANSCRIBE_RMS {
         return Ok(());
     }
-    inference_tx
+    if queued_windows.load(Ordering::Relaxed) >= MAX_QUEUED_WINDOWS {
+        *dropped_inference_windows += 1;
+        event_tx
+            .send(SessionEvent::InferenceBacklogDropped(
+                *dropped_inference_windows,
+            ))
+            .ok();
+        return Ok(());
+    }
+
+    queued_windows.fetch_add(1, Ordering::Relaxed);
+    if inference_tx
         .send(InferenceCommand::Transcribe {
-            audio: audio_chunk,
-            start_sample: chunk_start_sample,
+            audio: window.audio,
+            start_sample: window.start_sample,
         })
-        .context("Inference worker stopped while queueing audio")
+        .is_err()
+    {
+        queued_windows.fetch_sub(1, Ordering::Relaxed);
+        return Err(anyhow!("Inference worker stopped while queueing audio"));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "whisper")]
@@ -482,7 +679,7 @@ fn process_audio_chunk(
     event_tx: &Sender<SessionEvent>,
     writer: &mut TranscriptWriter,
     lines: &mut Vec<TranscriptLine>,
-    last_text: &mut String,
+    committed_text: &mut String,
     audio_chunk: &[f32],
     chunk_start_sample: u64,
 ) -> Result<()> {
@@ -493,11 +690,12 @@ fn process_audio_chunk(
     event_tx
         .send(SessionEvent::Status(SessionStatus::Processing))
         .ok();
-    match transcribe_chunk(state, config, audio_chunk, last_text.as_str()) {
+    let prompt = transcript_tail(committed_text, DEDUPE_TAIL_CHARS);
+    match transcribe_chunk(state, config, audio_chunk, &prompt) {
         Ok(text) => {
             let text = text.trim().to_string();
-            if !text.is_empty() && !is_duplicate(last_text, &text) {
-                *last_text = text.clone();
+            if let Some(text) = dedupe_window_text(committed_text, &text) {
+                append_segment_text(committed_text, &text);
                 let line = TranscriptLine {
                     timestamp: format_sample_timestamp(chunk_start_sample),
                     text,
@@ -573,6 +771,73 @@ fn append_segment_text(output: &mut String, segment: &str) {
         output.push(' ');
     }
     output.push_str(segment);
+}
+
+fn transcript_tail(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    text.chars().skip(char_count - max_chars).collect()
+}
+
+pub(crate) fn dedupe_window_text(previous: &str, current: &str) -> Option<String> {
+    let current = current.trim();
+    if current.is_empty() {
+        return None;
+    }
+
+    let previous_tail = transcript_tail(previous, DEDUPE_TAIL_CHARS);
+    let previous_norm = normalize_transcript_text(&previous_tail);
+    let current_norm = normalize_transcript_text(current);
+    if current_norm.is_empty() {
+        return None;
+    }
+    if previous_norm.contains(&current_norm) || previous_norm.ends_with(&current_norm) {
+        return None;
+    }
+
+    let current_chars = current.chars().collect::<Vec<_>>();
+    let threshold = dedupe_overlap_threshold_chars(&previous_norm, &current_norm);
+    let mut remove_chars = 0;
+    for len in (threshold..=current_chars.len()).rev() {
+        let prefix = current_chars[..len].iter().collect::<String>();
+        let prefix_norm = normalize_transcript_text(&prefix);
+        if !prefix_norm.is_empty() && previous_norm.ends_with(&prefix_norm) {
+            remove_chars = len;
+            break;
+        }
+    }
+
+    let deduped = current_chars[remove_chars..].iter().collect::<String>();
+    let deduped = trim_deduped_prefix(&deduped).trim().to_string();
+    if deduped.is_empty() {
+        None
+    } else {
+        Some(deduped)
+    }
+}
+
+fn trim_deduped_prefix(text: &str) -> &str {
+    text.trim_start_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '.'
+                    | '!'
+                    | '?'
+                    | ':'
+                    | ';'
+                    | '、'
+                    | '。'
+                    | '，'
+                    | '．'
+                    | '！'
+                    | '？'
+                    | '：'
+                    | '；'
+            )
+    })
 }
 
 fn resample_to_16k(input: &[f32], source_rate: u32) -> Vec<f32> {
@@ -738,6 +1003,149 @@ fn rms(samples: &[f32]) -> f32 {
     (sum / samples.len() as f32).sqrt()
 }
 
+fn seconds_to_samples(seconds: u64) -> usize {
+    seconds as usize * WHISPER_SAMPLE_RATE as usize
+}
+
+fn detect_speech_region(samples: &[f32]) -> Option<VadRegion> {
+    if samples.len() < VAD_MIN_SPEECH_SAMPLES {
+        return None;
+    }
+
+    let frames = frame_rms(samples);
+    if frames.is_empty() {
+        return None;
+    }
+    let threshold = vad_threshold(&frames);
+    let hangover_frames = VAD_HANGOVER_SAMPLES.div_ceil(VAD_FRAME_SAMPLES);
+
+    let mut best = None::<(usize, usize, usize)>;
+    let mut active_start = None::<usize>;
+    let mut last_speech_end = 0_usize;
+    let mut raw_speech_samples = 0_usize;
+    let mut silence_frames = 0_usize;
+
+    for (index, frame) in frames.iter().enumerate() {
+        let is_speech = frame.rms >= threshold;
+        if is_speech {
+            if active_start.is_none() {
+                active_start = Some(frame.start);
+                raw_speech_samples = 0;
+            }
+            raw_speech_samples += frame.end - frame.start;
+            last_speech_end = frame.end;
+            silence_frames = 0;
+            continue;
+        }
+
+        if let Some(start) = active_start {
+            silence_frames += 1;
+            if silence_frames > hangover_frames {
+                best = best_vad_region(best, start, last_speech_end, raw_speech_samples);
+                active_start = None;
+                raw_speech_samples = 0;
+                last_speech_end = 0;
+                silence_frames = 0;
+            } else if index + 1 == frames.len() {
+                best = best_vad_region(
+                    best,
+                    start,
+                    last_speech_end
+                        .saturating_add(VAD_HANGOVER_SAMPLES)
+                        .min(samples.len()),
+                    raw_speech_samples,
+                );
+            }
+        }
+    }
+
+    if let Some(start) = active_start {
+        best = best_vad_region(
+            best,
+            start,
+            last_speech_end
+                .saturating_add(VAD_HANGOVER_SAMPLES)
+                .min(samples.len()),
+            raw_speech_samples,
+        );
+    }
+
+    if let Some((start, end, _)) = best {
+        return Some(VadRegion { start, end });
+    }
+
+    let active_frames = frames
+        .iter()
+        .filter(|frame| frame.rms >= MIN_TRANSCRIBE_RMS)
+        .collect::<Vec<_>>();
+    let active_samples = active_frames
+        .iter()
+        .map(|frame| frame.end - frame.start)
+        .sum::<usize>();
+    if active_samples >= VAD_MIN_SPEECH_SAMPLES && active_samples * 2 >= samples.len() {
+        let start = active_frames.first().map(|frame| frame.start).unwrap_or(0);
+        let end = active_frames
+            .last()
+            .map(|frame| {
+                frame
+                    .end
+                    .saturating_add(VAD_HANGOVER_SAMPLES)
+                    .min(samples.len())
+            })
+            .unwrap_or(samples.len());
+        return Some(VadRegion { start, end });
+    }
+
+    None
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RmsFrame {
+    start: usize,
+    end: usize,
+    rms: f32,
+}
+
+fn frame_rms(samples: &[f32]) -> Vec<RmsFrame> {
+    samples
+        .chunks(VAD_FRAME_SAMPLES)
+        .enumerate()
+        .filter_map(|(index, frame)| {
+            if frame.len() < VAD_FRAME_SAMPLES / 2 {
+                return None;
+            }
+            let start = index * VAD_FRAME_SAMPLES;
+            Some(RmsFrame {
+                start,
+                end: start + frame.len(),
+                rms: rms(frame),
+            })
+        })
+        .collect()
+}
+
+fn vad_threshold(frames: &[RmsFrame]) -> f32 {
+    let mut levels = frames.iter().map(|frame| frame.rms).collect::<Vec<_>>();
+    levels.sort_by(|left, right| left.total_cmp(right));
+    let noise_floor = levels[levels.len() / 5];
+    (noise_floor * 3.0).max(MIN_TRANSCRIBE_RMS)
+}
+
+fn best_vad_region(
+    best: Option<(usize, usize, usize)>,
+    start: usize,
+    end: usize,
+    raw_speech_samples: usize,
+) -> Option<(usize, usize, usize)> {
+    if raw_speech_samples < VAD_MIN_SPEECH_SAMPLES {
+        return best;
+    }
+    match best {
+        Some((_, _, best_speech)) if best_speech >= raw_speech_samples => best,
+        _ => Some((start, end, raw_speech_samples)),
+    }
+}
+
 pub(crate) fn is_duplicate(previous: &str, current: &str) -> bool {
     let previous = normalize_transcript_text(previous);
     let current = normalize_transcript_text(current);
@@ -803,6 +1211,14 @@ fn is_transcript_punctuation(ch: char) -> bool {
 fn duplicate_threshold_chars(previous: &str, current: &str) -> usize {
     if previous.is_ascii() && current.is_ascii() {
         8
+    } else {
+        4
+    }
+}
+
+fn dedupe_overlap_threshold_chars(previous: &str, current: &str) -> usize {
+    if previous.is_ascii() && current.is_ascii() {
+        5
     } else {
         4
     }
@@ -1013,6 +1429,86 @@ mod tests {
         assert!(!is_duplicate("", ""));
         assert!(!is_duplicate("yes", "no"));
         assert!(!is_duplicate("alpha beta gamma", "gamma delta"));
+    }
+
+    #[test]
+    fn dedupe_window_text_removes_english_overlap_prefix() {
+        assert_eq!(
+            dedupe_window_text("hello world", "world again").as_deref(),
+            Some("again")
+        );
+    }
+
+    #[test]
+    fn dedupe_window_text_removes_japanese_overlap_prefix() {
+        assert_eq!(
+            dedupe_window_text("今日はテストです", "テストです。次に進みます").as_deref(),
+            Some("次に進みます")
+        );
+    }
+
+    #[test]
+    fn dedupe_window_text_skips_fully_committed_text() {
+        assert_eq!(
+            dedupe_window_text("これはテストです", "これはテストです"),
+            None
+        );
+    }
+
+    #[test]
+    fn vad_skips_silence_and_short_noise() {
+        let silence = vec![0.0; seconds_to_samples(2)];
+        assert_eq!(detect_speech_region(&silence), None);
+
+        let mut noise = vec![0.0; seconds_to_samples(2)];
+        for sample in &mut noise[..seconds_to_samples(1) / 10] {
+            *sample = 0.08;
+        }
+        assert_eq!(detect_speech_region(&noise), None);
+    }
+
+    #[test]
+    fn vad_detects_speech_and_keeps_hangover() {
+        let mut samples = vec![0.0; seconds_to_samples(2)];
+        for sample in &mut samples[seconds_to_samples(1) / 10..seconds_to_samples(1)] {
+            *sample = 0.02;
+        }
+        let region = detect_speech_region(&samples).expect("speech should be detected");
+        assert!(region.start <= seconds_to_samples(1) / 10 + VAD_FRAME_SAMPLES);
+        assert!(region.end > seconds_to_samples(1));
+    }
+
+    #[test]
+    fn rolling_segmenter_emits_balanced_windows_every_step() {
+        let profile = LatencyProfile {
+            window_samples: seconds_to_samples(8),
+            step_samples: seconds_to_samples(2),
+        };
+        let mut segmenter = RollingSegmenter::new(profile);
+        let speech = vec![0.02; seconds_to_samples(8)];
+        let windows = segmenter.push(&speech);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].audio.len(), seconds_to_samples(8));
+        assert_eq!(windows[0].start_sample, 0);
+
+        let windows = segmenter.push(&vec![0.02; seconds_to_samples(2)]);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].audio.len(), seconds_to_samples(8));
+        assert_eq!(windows[0].start_sample, seconds_to_samples(2) as u64);
+    }
+
+    #[test]
+    fn rolling_segmenter_prunes_without_losing_timestamps() {
+        let profile = LatencyProfile {
+            window_samples: seconds_to_samples(8),
+            step_samples: seconds_to_samples(2),
+        };
+        let mut segmenter = RollingSegmenter::new(profile);
+        let windows = segmenter.push(&vec![0.02; seconds_to_samples(14)]);
+        assert_eq!(windows.len(), 4);
+        assert_eq!(windows[0].start_sample, 0);
+        assert_eq!(windows[3].start_sample, seconds_to_samples(6) as u64);
+        assert!(segmenter.buffer_start_sample > 0);
     }
 
     #[test]
