@@ -78,6 +78,9 @@ impl UserConfig {
         if config.threads == 0 {
             config.threads = 1;
         }
+        if config.microphone.as_deref() == Some("") {
+            config.microphone = None;
+        }
         Ok(config)
     }
 
