@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.1
+
+- Split microphone capture/segmentation from Whisper inference so slow transcription no longer blocks audio queue draining.
+- Finalization now stops capture before draining queued audio, reducing the chance of losing the last moments of speech.
+- Whisper live/file transcription now keeps decoder context, uses the previous segment as a prompt, and joins multi-segment output without collapsing English words.
+
 ## v0.3.0
 
 - Added `--version`, `live --plain`, `live --jsonl`, `live --device`, `live --format`, `file <audio.wav>`, `doctor --json`, `models verify`, `models remove`, and `config get/set`.

@@ -17,6 +17,10 @@ use std::{
     io::{BufWriter, Seek, SeekFrom, Write},
     ops::Range,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -58,6 +62,13 @@ pub enum SessionEvent {
 #[derive(Clone, Debug)]
 pub enum SessionCommand {
     SetPaused(bool),
+    SaveNow,
+    Stop,
+}
+
+#[cfg(feature = "whisper")]
+enum InferenceCommand {
+    Transcribe { audio: Vec<f32>, start_sample: u64 },
     SaveNow,
     Stop,
 }
@@ -150,10 +161,6 @@ fn run_worker(
     event_tx: Sender<SessionEvent>,
     stats: TranscriberStats,
 ) -> Result<()> {
-    let model =
-        model_by_name(&config.model).ok_or_else(|| anyhow!("Unknown model '{}'", config.model))?;
-    let model_path = paths.model_path(model);
-
     event_tx
         .send(SessionEvent::Status(SessionStatus::Loading))
         .ok();
@@ -166,33 +173,67 @@ fn run_worker(
 
     #[cfg(feature = "whisper")]
     {
-        let context =
-            WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
-                .with_context(|| format!("Failed to load model {}", model_path.display()))?;
-        let mut state = context
-            .create_state()
-            .context("Failed to create whisper state")?;
+        let (inference_tx, inference_rx) = unbounded::<InferenceCommand>();
+        let (ready_tx, ready_rx) = bounded(1);
+        let paused_state = Arc::new(AtomicBool::new(config.start_paused));
+        let inference_paused_state = paused_state.clone();
+        let inference_paths = paths.clone();
+        let inference_config = config.clone();
+        let inference_output_path = output_path.clone();
+        let inference_event_tx = event_tx.clone();
+        let inference_worker = thread::spawn(move || {
+            if let Err(error) = run_inference_worker(
+                inference_paths,
+                inference_config,
+                inference_output_path,
+                inference_rx,
+                inference_event_tx.clone(),
+                inference_paused_state,
+                ready_tx,
+            ) {
+                let _ = inference_event_tx.send(SessionEvent::Error(format!("{error:#}")));
+                let _ = inference_event_tx.send(SessionEvent::Status(SessionStatus::Error));
+            }
+        });
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                let _ = inference_worker.join();
+                return Err(anyhow!(message));
+            }
+            Err(_) => {
+                let _ = inference_worker.join();
+                return Err(anyhow!("Inference worker exited during startup"));
+            }
+        }
 
         let (audio_tx, audio_rx) = bounded::<Vec<f32>>(512);
         let (level_tx, level_rx) = bounded::<f32>(8);
         let (stream_error_tx, stream_error_rx) = bounded::<String>(8);
-        let capture = audio::start_capture(
+        let mut capture = Some(audio::start_capture(
             config.microphone.as_deref(),
             audio_tx,
             level_tx,
             stream_error_tx,
             stats.audio_callback.clone(),
-        )?;
+        )?);
+        let source_rate = capture
+            .as_ref()
+            .map(|capture| capture.sample_rate)
+            .unwrap_or(WHISPER_SAMPLE_RATE);
         event_tx
-            .send(SessionEvent::Microphone(capture.device_name.clone()))
+            .send(SessionEvent::Microphone(
+                capture
+                    .as_ref()
+                    .map(|capture| capture.device_name.clone())
+                    .unwrap_or_else(|| "Microphone".to_string()),
+            ))
             .ok();
 
         let mut paused = config.start_paused;
-        let mut lines = Vec::<TranscriptLine>::new();
-        let mut writer = TranscriptWriter::new(output_path.clone(), config.output_format);
         let mut pending = Vec::<f32>::new();
         let mut pending_start_sample = 0_u64;
-        let mut last_text = String::new();
         let mut last_reported_audio_drops = 0_u64;
         let chunk_samples = (config.chunk_seconds.max(2) as usize) * WHISPER_SAMPLE_RATE as usize;
 
@@ -209,6 +250,7 @@ fn run_worker(
                 match command {
                     SessionCommand::SetPaused(next) => {
                         paused = next;
+                        paused_state.store(paused, Ordering::Relaxed);
                         event_tx
                             .send(SessionEvent::Status(if paused {
                                 SessionStatus::Paused
@@ -221,61 +263,36 @@ fn run_worker(
                         event_tx
                             .send(SessionEvent::Status(SessionStatus::Saving))
                             .ok();
-                        writer.flush()?;
-                        event_tx.send(SessionEvent::Saved(output_path.clone())).ok();
-                        event_tx
-                            .send(SessionEvent::Status(if paused {
-                                SessionStatus::Paused
-                            } else {
-                                SessionStatus::Listening
-                            }))
-                            .ok();
+                        inference_tx
+                            .send(InferenceCommand::SaveNow)
+                            .context("Inference worker stopped before saving")?;
                     }
                     SessionCommand::Stop => {
                         event_tx
                             .send(SessionEvent::Status(SessionStatus::Saving))
                             .ok();
+                        capture.take();
                         if !paused {
-                            drain_audio_queue(&audio_rx, &mut pending, capture.sample_rate);
+                            drain_audio_queue(&audio_rx, &mut pending, source_rate);
                         }
-                        while pending.len() >= chunk_samples {
-                            let rest = pending.split_off(chunk_samples);
-                            let audio_chunk = std::mem::replace(&mut pending, rest);
-                            let chunk_start_sample = pending_start_sample;
-                            pending_start_sample += audio_chunk.len() as u64;
-                            process_audio_chunk(
-                                &mut state,
-                                &config,
-                                &output_path,
-                                &event_tx,
-                                &mut writer,
-                                &mut lines,
-                                &mut last_text,
-                                &audio_chunk,
-                                chunk_start_sample,
-                            )?;
-                        }
+                        queue_ready_chunks(
+                            &mut pending,
+                            &mut pending_start_sample,
+                            chunk_samples,
+                            &inference_tx,
+                        )?;
                         if pending.len() >= STOP_FLUSH_MIN_SAMPLES {
                             let audio_chunk = std::mem::take(&mut pending);
                             let chunk_start_sample = pending_start_sample;
-                            process_audio_chunk(
-                                &mut state,
-                                &config,
-                                &output_path,
-                                &event_tx,
-                                &mut writer,
-                                &mut lines,
-                                &mut last_text,
-                                &audio_chunk,
-                                chunk_start_sample,
-                            )?;
+                            queue_audio_chunk(&inference_tx, audio_chunk, chunk_start_sample)?;
                         }
-                        writer.flush()?;
+                        inference_tx
+                            .send(InferenceCommand::Stop)
+                            .context("Inference worker stopped before finalizing")?;
+                        inference_worker
+                            .join()
+                            .map_err(|_| anyhow!("Inference worker panicked"))?;
                         report_audio_drop_stats(&stats, &event_tx, &mut last_reported_audio_drops);
-                        event_tx.send(SessionEvent::Saved(output_path.clone())).ok();
-                        event_tx
-                            .send(SessionEvent::Status(SessionStatus::Stopped))
-                            .ok();
                         return Ok(());
                     }
                 }
@@ -298,12 +315,63 @@ fn run_worker(
                 continue;
             }
 
-            pending.extend(resample_to_16k(&chunk, capture.sample_rate));
-            while pending.len() >= chunk_samples {
-                let rest = pending.split_off(chunk_samples);
-                let audio_chunk = std::mem::replace(&mut pending, rest);
-                let chunk_start_sample = pending_start_sample;
-                pending_start_sample += audio_chunk.len() as u64;
+            pending.extend(resample_to_16k(&chunk, source_rate));
+            drain_audio_queue(&audio_rx, &mut pending, source_rate);
+            queue_ready_chunks(
+                &mut pending,
+                &mut pending_start_sample,
+                chunk_samples,
+                &inference_tx,
+            )?;
+        }
+    }
+}
+
+#[cfg(feature = "whisper")]
+fn run_inference_worker(
+    paths: AppPaths,
+    config: UserConfig,
+    output_path: PathBuf,
+    command_rx: Receiver<InferenceCommand>,
+    event_tx: Sender<SessionEvent>,
+    paused_state: Arc<AtomicBool>,
+    ready_tx: Sender<std::result::Result<(), String>>,
+) -> Result<()> {
+    let model =
+        model_by_name(&config.model).ok_or_else(|| anyhow!("Unknown model '{}'", config.model))?;
+    let model_path = paths.model_path(model);
+    let context =
+        match WhisperContext::new_with_params(&model_path, WhisperContextParameters::default())
+            .with_context(|| format!("Failed to load model {}", model_path.display()))
+        {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!("{error:#}")));
+                return Err(error);
+            }
+        };
+    let mut state = match context
+        .create_state()
+        .context("Failed to create whisper state")
+    {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = ready_tx.send(Err(format!("{error:#}")));
+            return Err(error);
+        }
+    };
+    let _ = ready_tx.send(Ok(()));
+
+    let mut lines = Vec::<TranscriptLine>::new();
+    let mut writer = TranscriptWriter::new(output_path.clone(), config.output_format);
+    let mut last_text = String::new();
+
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            InferenceCommand::Transcribe {
+                audio,
+                start_sample,
+            } => {
                 process_audio_chunk(
                     &mut state,
                     &config,
@@ -312,14 +380,40 @@ fn run_worker(
                     &mut writer,
                     &mut lines,
                     &mut last_text,
-                    &audio_chunk,
-                    chunk_start_sample,
+                    &audio,
+                    start_sample,
                 )?;
                 event_tx
-                    .send(SessionEvent::Status(SessionStatus::Listening))
+                    .send(SessionEvent::Status(current_session_status(&paused_state)))
                     .ok();
             }
+            InferenceCommand::SaveNow => {
+                writer.flush()?;
+                event_tx.send(SessionEvent::Saved(output_path.clone())).ok();
+                event_tx
+                    .send(SessionEvent::Status(current_session_status(&paused_state)))
+                    .ok();
+            }
+            InferenceCommand::Stop => {
+                writer.flush()?;
+                event_tx.send(SessionEvent::Saved(output_path.clone())).ok();
+                event_tx
+                    .send(SessionEvent::Status(SessionStatus::Stopped))
+                    .ok();
+                return Ok(());
+            }
         }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "whisper")]
+fn current_session_status(paused_state: &AtomicBool) -> SessionStatus {
+    if paused_state.load(Ordering::Relaxed) {
+        SessionStatus::Paused
+    } else {
+        SessionStatus::Listening
     }
 }
 
@@ -346,6 +440,40 @@ fn drain_audio_queue(audio_rx: &Receiver<Vec<f32>>, pending: &mut Vec<f32>, sour
 }
 
 #[cfg(feature = "whisper")]
+fn queue_ready_chunks(
+    pending: &mut Vec<f32>,
+    pending_start_sample: &mut u64,
+    chunk_samples: usize,
+    inference_tx: &Sender<InferenceCommand>,
+) -> Result<()> {
+    while pending.len() >= chunk_samples {
+        let rest = pending.split_off(chunk_samples);
+        let audio_chunk = std::mem::replace(pending, rest);
+        let chunk_start_sample = *pending_start_sample;
+        *pending_start_sample += audio_chunk.len() as u64;
+        queue_audio_chunk(inference_tx, audio_chunk, chunk_start_sample)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "whisper")]
+fn queue_audio_chunk(
+    inference_tx: &Sender<InferenceCommand>,
+    audio_chunk: Vec<f32>,
+    chunk_start_sample: u64,
+) -> Result<()> {
+    if rms(&audio_chunk) < MIN_TRANSCRIBE_RMS {
+        return Ok(());
+    }
+    inference_tx
+        .send(InferenceCommand::Transcribe {
+            audio: audio_chunk,
+            start_sample: chunk_start_sample,
+        })
+        .context("Inference worker stopped while queueing audio")
+}
+
+#[cfg(feature = "whisper")]
 #[allow(clippy::too_many_arguments)]
 fn process_audio_chunk(
     state: &mut whisper_rs::WhisperState,
@@ -365,7 +493,7 @@ fn process_audio_chunk(
     event_tx
         .send(SessionEvent::Status(SessionStatus::Processing))
         .ok();
-    match transcribe_chunk(state, config, audio_chunk) {
+    match transcribe_chunk(state, config, audio_chunk, last_text.as_str()) {
         Ok(text) => {
             let text = text.trim().to_string();
             if !text.is_empty() && !is_duplicate(last_text, &text) {
@@ -397,6 +525,7 @@ fn transcribe_chunk(
     state: &mut whisper_rs::WhisperState,
     config: &UserConfig,
     samples: &[f32],
+    initial_prompt: &str,
 ) -> Result<String> {
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     let language = config.language.trim();
@@ -411,8 +540,13 @@ fn transcribe_chunk(
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
-    params.set_single_segment(true);
-    params.set_no_context(true);
+    params.set_no_timestamps(true);
+    params.set_single_segment(false);
+    params.set_no_context(false);
+    let initial_prompt = initial_prompt.trim();
+    if !initial_prompt.is_empty() && !initial_prompt.contains('\0') {
+        params.set_initial_prompt(initial_prompt);
+    }
 
     state
         .full(params, samples)
@@ -420,9 +554,25 @@ fn transcribe_chunk(
 
     let mut text = String::new();
     for segment in state.as_iter() {
-        text.push_str(segment.to_string().trim());
+        append_segment_text(&mut text, segment.to_string().trim());
     }
     Ok(text)
+}
+
+fn append_segment_text(output: &mut String, segment: &str) {
+    if segment.is_empty() {
+        return;
+    }
+    if output
+        .chars()
+        .last()
+        .zip(segment.chars().next())
+        .map(|(left, right)| left.is_ascii_alphanumeric() && right.is_ascii_alphanumeric())
+        .unwrap_or(false)
+    {
+        output.push(' ');
+    }
+    output.push_str(segment);
 }
 
 fn resample_to_16k(input: &[f32], source_rate: u32) -> Vec<f32> {
@@ -477,7 +627,7 @@ pub(crate) fn transcribe_wav_file(
             if audio_chunk.len() < STOP_FLUSH_MIN_SAMPLES || rms(audio_chunk) < MIN_TRANSCRIBE_RMS {
                 continue;
             }
-            let text = transcribe_chunk(&mut state, &config, audio_chunk)?
+            let text = transcribe_chunk(&mut state, &config, audio_chunk, &last_text)?
                 .trim()
                 .to_string();
             if text.is_empty() || is_duplicate(&last_text, &text) {
@@ -871,6 +1021,19 @@ mod tests {
             format_sample_timestamp(WHISPER_SAMPLE_RATE as u64 * 65),
             "00:01:05"
         );
+    }
+
+    #[test]
+    fn append_segment_text_keeps_words_readable() {
+        let mut output = String::new();
+        append_segment_text(&mut output, "hello");
+        append_segment_text(&mut output, "world");
+        assert_eq!(output, "hello world");
+
+        let mut output = String::new();
+        append_segment_text(&mut output, "これは");
+        append_segment_text(&mut output, "テストです");
+        assert_eq!(output, "これはテストです");
     }
 
     #[test]
