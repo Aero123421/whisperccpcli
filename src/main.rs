@@ -533,16 +533,13 @@ fn render_actions(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarg
 
     let mut targets = Vec::new();
     if app.screen_mode == ScreenMode::SetupRequired {
-        frame.render_widget(
-            button("Install model", "click or press i"),
-            rows[1],
-        );
+        frame.render_widget(button("Install model", "click or press i"), rows[1]);
         targets.push(MouseTarget {
             area: rows[1],
             action: MouseAction::InstallModel,
         });
     } else {
-        frame.render_widget(button("Waiting", "audio engine pending"), rows[1]);
+        frame.render_widget(status_panel("Recording unavailable", "this build cannot capture audio yet"), rows[1]);
     }
 
     frame.render_widget(button("Quit", "click or press q"), rows[2]);
@@ -562,7 +559,7 @@ fn header(app: &App) -> Paragraph<'_> {
     );
     let state = match app.screen_mode {
         ScreenMode::SetupRequired => " SETUP ",
-        ScreenMode::EnginePending => " ENGINE PENDING ",
+        ScreenMode::EnginePending => " NOT RECORDING ",
     };
     let meta = Span::styled(
         format!(
@@ -593,8 +590,8 @@ fn setup_message(app: &App) -> Paragraph<'_> {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("whisperCLI will not show fake transcript text or simulated audio."),
-        Line::from("Install a local whisper.cpp model before starting transcription."),
+        Line::from("A local model is required before transcription can start."),
+        Line::from("Press i or click Install model to download the recommended model."),
         Line::from(""),
         Line::from(vec![
             Span::styled("Recommended: ", muted()),
@@ -617,14 +614,14 @@ fn setup_message(app: &App) -> Paragraph<'_> {
 fn engine_message(app: &App) -> Paragraph<'_> {
     let lines = vec![
         Line::from(Span::styled(
-            "Ready for the audio engine implementation",
+            "Recording is not available in this build",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("No transcript is shown until real microphone input and whisper.cpp decoding are connected."),
-        Line::from("The model is installed, so the next implementation step is cpal input + whisper-rs streaming."),
+        Line::from("The selected model is installed, but microphone capture is not enabled yet."),
+        Line::from("No transcript will appear until recording support is added."),
         Line::from(""),
         Line::from(vec![
             Span::styled("Output path: ", muted()),
@@ -633,7 +630,7 @@ fn engine_message(app: &App) -> Paragraph<'_> {
     ];
 
     Paragraph::new(lines)
-        .block(base_block().title(" Live Transcript "))
+        .block(base_block().title(" Transcription "))
         .wrap(Wrap { trim: false })
 }
 
@@ -678,12 +675,19 @@ fn button(label: &'static str, hint: &'static str) -> Paragraph<'static> {
     .alignment(Alignment::Center)
 }
 
+fn status_panel(label: &'static str, hint: &'static str) -> Paragraph<'static> {
+    Paragraph::new(Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {hint}"), muted()),
+    ]))
+    .block(base_block())
+    .alignment(Alignment::Center)
+}
+
 fn commands(app: &App) -> Paragraph<'static> {
     let line = match app.screen_mode {
-        ScreenMode::SetupRequired => "Commands  i install model   q/Esc/Ctrl+C quit   mouse click supported",
-        ScreenMode::EnginePending => {
-            "Commands  q/Esc/Ctrl+C quit   mouse click supported   no fake transcript"
-        }
+        ScreenMode::SetupRequired => "Commands  i install model   q/Esc/Ctrl+C quit   click buttons to select",
+        ScreenMode::EnginePending => "Commands  q/Esc/Ctrl+C quit   click Quit to exit",
     };
 
     Paragraph::new(Line::from(vec![

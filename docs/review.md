@@ -9,7 +9,7 @@
 - Model state was only visual. `whispercli models install tiny|base` now downloads ggml models and verifies SHA1 from the whisper.cpp model table.
 - Errors were mostly raw `?` propagation. The current code adds context around filesystem, terminal, download, checksum, and PATH setup failures.
 - Distribution was undefined. CI, release packaging, npm wrapper, and Windows installer scripts are now present.
-- The TUI no longer shows fake transcript text, fake microphone devices, fake audio levels, or advertised shortcuts that do not exist.
+- The TUI no longer shows placeholder transcript text, placeholder microphone devices, placeholder audio levels, or advertised shortcuts that do not exist.
 - `whispercli` with no subcommand now opens the TUI.
 - Mouse capture is enabled for the TUI, with clickable setup and quit actions.
 
