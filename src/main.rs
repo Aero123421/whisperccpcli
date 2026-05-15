@@ -1,14 +1,14 @@
-use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
-use std::{
-    env,
-    fs::{self, File},
-    io::{self, Write},
-    path::{Path, PathBuf},
-    process::Command,
-    time::{Duration, Instant},
-};
+mod app;
+mod audio;
+mod settings;
+mod transcriber;
 
+use anyhow::{Context, Result};
+use app::{
+    add_current_exe_dir_to_path, install_model, is_model_installed, model_by_name, AppPaths, MODELS,
+};
+use audio::input_devices;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -19,19 +19,24 @@ use crossterm::{
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    prelude::{Backend, CrosstermBackend, Frame, Terminal},
+    prelude::{CrosstermBackend, Frame, Terminal},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Gauge, Paragraph, Wrap},
 };
-use sha1::{Digest, Sha1};
-
-const APP_DIR_NAME: &str = ".whispercli";
-const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+use settings::{TranscriptFormat, UserConfig};
+use std::{
+    env, io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+use transcriber::{
+    start_session, SessionCommand, SessionEvent, SessionHandle, SessionStatus, TranscriptLine,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "whispercli")]
-#[command(about = "Lightweight local Whisper transcription CLI")]
+#[command(about = "Local real-time transcription with whisper.cpp")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -39,8 +44,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Start the transcription TUI.
+    /// Open the live transcription TUI.
     Live(LiveArgs),
+    /// Open the settings TUI.
+    Config,
+    /// List available input devices.
+    Devices,
     /// Create user directories and print install diagnostics.
     Init(InitArgs),
     /// Inspect paths and platform setup.
@@ -52,29 +61,19 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Parser, Clone)]
+#[derive(Debug, Parser, Clone, Default)]
 struct LiveArgs {
-    /// Output transcript path.
-    #[arg(long, default_value = "meeting.md")]
-    out: String,
+    /// Output transcript file name or path.
+    #[arg(long)]
+    out: Option<String>,
 
     /// Whisper model name.
-    #[arg(long, default_value = "tiny")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
 
-    /// Recognition language.
-    #[arg(long, default_value = "ja")]
-    lang: String,
-}
-
-impl Default for LiveArgs {
-    fn default() -> Self {
-        Self {
-            out: "meeting.md".to_string(),
-            model: "tiny".to_string(),
-            lang: "ja".to_string(),
-        }
-    }
+    /// Recognition language, for example ja, en, or auto.
+    #[arg(long)]
+    lang: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -90,149 +89,46 @@ enum ModelCommand {
     List,
     /// Download a model into ~/.whispercli/models.
     Install {
-        /// Model name: tiny or base.
+        /// Model name: tiny, base, or small.
         #[arg(default_value = "tiny")]
         model: String,
     },
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ModelInfo {
-    name: &'static str,
-    file_name: &'static str,
-    size: &'static str,
-    sha1: &'static str,
-}
-
-const MODELS: &[ModelInfo] = &[
-    ModelInfo {
-        name: "tiny",
-        file_name: "ggml-tiny.bin",
-        size: "75 MiB",
-        sha1: "bd577a113a864445d4c299885e0cb97d4ba92b5f",
-    },
-    ModelInfo {
-        name: "base",
-        file_name: "ggml-base.bin",
-        size: "142 MiB",
-        sha1: "465707469ff3a37a2b9b8d8f89f2f99de7299dac",
-    },
-];
-
-#[derive(Debug)]
-struct AppPaths {
-    root: PathBuf,
-    bin: PathBuf,
-    models: PathBuf,
-    transcripts: PathBuf,
-    logs: PathBuf,
-}
-
-impl AppPaths {
-    fn new() -> Result<Self> {
-        let home = home_dir().context("Could not determine your home directory")?;
-        let root = home.join(APP_DIR_NAME);
-
-        Ok(Self {
-            bin: root.join("bin"),
-            models: root.join("models"),
-            transcripts: root.join("transcripts"),
-            logs: root.join("logs"),
-            root,
-        })
-    }
-
-    fn ensure(&self) -> Result<()> {
-        for dir in [&self.root, &self.bin, &self.models, &self.transcripts, &self.logs] {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("Failed to create {}", dir.display()))?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScreenMode {
-    SetupRequired,
-    EnginePending,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MouseAction {
-    InstallModel,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveAction {
+    DownloadModel,
+    Settings,
+    Pause,
+    Save,
     Quit,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigAction {
+    Section(usize),
+    Model(usize),
+    DownloadModel(usize),
+    Device(usize),
+    OutputDir(usize),
+    Format(usize),
+    Language(usize),
+    Back,
+    Save,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetAction {
+    Live(LiveAction),
+    Config(ConfigAction),
+}
+
+#[derive(Clone, Debug)]
 struct MouseTarget {
+    id: usize,
     area: Rect,
-    action: MouseAction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunOutcome {
-    Quit,
-    InstallModel,
-}
-
-#[derive(Debug)]
-struct App {
-    args: LiveArgs,
-    paths: AppPaths,
-    started_at: Instant,
-    running: bool,
-    outcome: RunOutcome,
-    screen_mode: ScreenMode,
-    selected_model: ModelInfo,
-    mouse_targets: Vec<MouseTarget>,
-}
-
-impl App {
-    fn new(args: LiveArgs, paths: AppPaths) -> Result<Self> {
-        let selected_model = model_by_name(&args.model).ok_or_else(|| {
-            anyhow!(
-                "Unknown model '{}'. Supported models: tiny, base",
-                args.model
-            )
-        })?;
-        let screen_mode = if paths.models.join(selected_model.file_name).exists() {
-            ScreenMode::EnginePending
-        } else {
-            ScreenMode::SetupRequired
-        };
-
-        Ok(Self {
-            args,
-            paths,
-            started_at: Instant::now(),
-            running: true,
-            outcome: RunOutcome::Quit,
-            screen_mode,
-            selected_model,
-            mouse_targets: Vec::new(),
-        })
-    }
-
-    fn elapsed(&self) -> String {
-        let secs = self.started_at.elapsed().as_secs();
-        format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
-    }
-
-    fn request_install(&mut self) {
-        if self.screen_mode == ScreenMode::SetupRequired {
-            self.outcome = RunOutcome::InstallModel;
-            self.running = false;
-        }
-    }
-
-    fn quit(&mut self) {
-        self.outcome = RunOutcome::Quit;
-        self.running = false;
-    }
-
-    fn set_mouse_targets(&mut self, targets: Vec<MouseTarget>) {
-        self.mouse_targets = targets;
-    }
+    enabled: bool,
+    action: TargetAction,
 }
 
 struct TerminalGuard;
@@ -262,23 +158,27 @@ fn main() {
 
 fn try_main() -> Result<()> {
     let cli = Cli::parse();
-
     match cli.command {
-        Some(Commands::Live(args)) => run_tui(args),
+        Some(Commands::Live(args)) => run_live(args),
+        Some(Commands::Config) => run_config_loop(),
+        Some(Commands::Devices) => devices(),
         Some(Commands::Init(args)) => init(args),
         Some(Commands::Doctor) => doctor(),
         Some(Commands::Models { command }) => models(command),
-        None => run_tui(LiveArgs::default()),
+        None => run_live(LiveArgs::default()),
     }
 }
 
 fn init(args: InitArgs) -> Result<()> {
     let paths = AppPaths::new()?;
     paths.ensure()?;
+    let config = UserConfig::load_or_create(&paths)?;
 
     println!("created {}", paths.root.display());
     println!("models  {}", paths.models.display());
     println!("bin     {}", paths.bin.display());
+    println!("config  {}", paths.config.display());
+    println!("output  {}", config.output_dir.display());
 
     if args.add_to_path {
         add_current_exe_dir_to_path()?;
@@ -290,6 +190,7 @@ fn init(args: InitArgs) -> Result<()> {
 fn doctor() -> Result<()> {
     let paths = AppPaths::new()?;
     paths.ensure()?;
+    let config = UserConfig::load_or_create(&paths)?;
 
     println!("whisperCLI paths");
     println!("root        {}", paths.root.display());
@@ -297,11 +198,52 @@ fn doctor() -> Result<()> {
     println!("models      {}", paths.models.display());
     println!("transcripts {}", paths.transcripts.display());
     println!("logs        {}", paths.logs.display());
+    println!("config      {}", paths.config.display());
     println!();
     println!("platform    {}", env::consts::OS);
     println!("arch        {}", env::consts::ARCH);
     println!("exe         {}", env::current_exe()?.display());
+    println!();
+    println!("settings");
+    println!("model       {}", config.model);
+    println!("language    {}", config.language);
+    println!(
+        "microphone  {}",
+        config.microphone.as_deref().unwrap_or("default")
+    );
+    println!("output      {}", config.output_dir.display());
+    println!("format      {}", config.output_format.label());
+    println!();
+    println!("models");
+    for model in MODELS {
+        let state = if is_model_installed(&paths, *model) {
+            "installed"
+        } else {
+            "missing"
+        };
+        println!("{:<6} {:<10} {}", model.name, model.size, state);
+    }
+    println!();
+    println!("microphones");
+    for device in input_devices()? {
+        let marker = if device.is_default { "*" } else { " " };
+        println!(
+            "{} {:<2} {:<40} {}",
+            marker, device.index, device.name, device.config
+        );
+    }
 
+    Ok(())
+}
+
+fn devices() -> Result<()> {
+    for device in input_devices()? {
+        let marker = if device.is_default { "*" } else { " " };
+        println!(
+            "{} {:<2} {:<40} {}",
+            marker, device.index, device.name, device.config
+        );
+    }
     Ok(())
 }
 
@@ -312,7 +254,7 @@ fn models(command: ModelCommand) -> Result<()> {
     match command {
         ModelCommand::List => {
             for model in MODELS {
-                let path = paths.models.join(model.file_name);
+                let path = paths.model_path(*model);
                 let state = if path.exists() {
                     "installed"
                 } else {
@@ -332,370 +274,1112 @@ fn models(command: ModelCommand) -> Result<()> {
     }
 }
 
-fn install_model(paths: &AppPaths, requested: &str) -> Result<()> {
-    let model = model_by_name(requested)
-        .ok_or_else(|| anyhow!("Unknown model '{requested}'. Supported models: tiny, base"))?;
-    let target = paths.models.join(model.file_name);
-    if target.exists() {
-        verify_sha1(&target, model.sha1)
-            .with_context(|| format!("Installed model is corrupt: {}", target.display()))?;
-        println!(
-            "model '{}' already installed at {}",
-            model.name,
-            target.display()
-        );
-        return Ok(());
+fn effective_config(paths: &AppPaths, args: &LiveArgs) -> Result<UserConfig> {
+    let mut config = UserConfig::load_or_create(paths)?;
+    if let Some(model) = &args.model {
+        config.model = model.clone();
     }
-
-    let url = format!("{MODEL_BASE_URL}/{}", model.file_name);
-    let temp = target.with_extension("bin.part");
-    println!("downloading {} ({})", model.name, model.size);
-    println!("{url}");
-
-    let mut response = reqwest::blocking::get(&url)
-        .with_context(|| format!("Failed to start download from {url}"))?
-        .error_for_status()
-        .with_context(|| format!("Model server returned an error for {url}"))?;
-    let mut file =
-        File::create(&temp).with_context(|| format!("Failed to create {}", temp.display()))?;
-    io::copy(&mut response, &mut file)
-        .with_context(|| format!("Failed to write {}", temp.display()))?;
-    file.flush()?;
-
-    verify_sha1(&temp, model.sha1).with_context(|| "Downloaded model checksum did not match")?;
-    fs::rename(&temp, &target)
-        .with_context(|| format!("Failed to move model into {}", target.display()))?;
-
-    println!("installed {}", target.display());
-    Ok(())
-}
-
-fn verify_sha1(path: &Path, expected: &str) -> Result<()> {
-    let bytes = fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let actual = format!("{:x}", Sha1::digest(&bytes));
-    if actual != expected {
-        bail!(
-            "SHA1 mismatch for {}: expected {}, got {}",
-            path.display(),
-            expected,
-            actual
-        );
+    if let Some(lang) = &args.lang {
+        config.language = lang.clone();
     }
-    Ok(())
+    Ok(config)
 }
 
-fn model_by_name(name: &str) -> Option<ModelInfo> {
-    MODELS.iter().copied().find(|model| model.name == name)
-}
-
-fn run_tui(args: LiveArgs) -> Result<()> {
+fn run_live(args: LiveArgs) -> Result<()> {
     let paths = AppPaths::new()?;
     paths.ensure()?;
 
-    let outcome = {
-        let _guard = TerminalGuard::enter()?;
-        let backend = CrosstermBackend::new(io::stdout());
-        let mut terminal = Terminal::new(backend).context("Failed to create terminal backend")?;
-        let outcome = run_app(&mut terminal, App::new(args.clone(), paths)?)?;
-        terminal.show_cursor().ok();
-        outcome
-    };
-
-    if outcome == RunOutcome::InstallModel {
-        let paths = AppPaths::new()?;
-        paths.ensure()?;
-        install_model(&paths, &args.model)?;
-        println!();
-        println!("model installed. Run `whispercli` to return to the TUI.");
+    loop {
+        let config = effective_config(&paths, &args)?;
+        let outcome = run_live_tui(paths.clone(), config, args.out.clone())?;
+        match outcome {
+            LiveOutcome::Quit => return Ok(()),
+            LiveOutcome::OpenConfig => run_config_loop()?,
+            LiveOutcome::InstallModel(model) => install_model(&paths, &model)?,
+        }
     }
-
-    Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<RunOutcome> {
-    let tick_rate = Duration::from_millis(250);
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum LiveOutcome {
+    Quit,
+    OpenConfig,
+    InstallModel(String),
+}
 
-    while app.running {
-        terminal.draw(|frame| render(frame, &mut app))?;
+struct LiveUi {
+    config: UserConfig,
+    session: Option<SessionHandle>,
+    status: SessionStatus,
+    transcript: Vec<TranscriptLine>,
+    output_path: Option<PathBuf>,
+    microphone: String,
+    level: f32,
+    paused: bool,
+    started_at: Instant,
+    message: String,
+    targets: Vec<MouseTarget>,
+    hovered: Option<usize>,
+    focused: usize,
+}
+
+fn run_live_tui(
+    paths: AppPaths,
+    config: UserConfig,
+    out_override: Option<String>,
+) -> Result<LiveOutcome> {
+    let session = match model_by_name(&config.model) {
+        Some(model) if is_model_installed(&paths, model) => {
+            match start_session(paths.clone(), config.clone(), out_override) {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    eprintln!("error: {error:#}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let mut ui = LiveUi {
+        output_path: session.as_ref().map(|session| session.output_path.clone()),
+        session,
+        config,
+        status: SessionStatus::Loading,
+        transcript: Vec::new(),
+        microphone: "default".to_string(),
+        level: 0.0,
+        paused: false,
+        started_at: Instant::now(),
+        message: String::new(),
+        targets: Vec::new(),
+        hovered: None,
+        focused: 0,
+    };
+
+    if ui.session.is_none() {
+        ui.status = SessionStatus::Error;
+        ui.message = "Install a model and choose a microphone in Settings.".to_string();
+    }
+
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).context("Failed to create terminal backend")?;
+    let tick_rate = Duration::from_millis(100);
+
+    loop {
+        drain_session_events(&mut ui);
+        terminal.draw(|frame| render_live(frame, &mut ui))?;
 
         if event::poll(tick_rate)? {
             match event::read()? {
-                Event::Key(key) => handle_key(key, &mut app),
-                Event::Mouse(mouse) => handle_mouse(mouse, &mut app),
+                Event::Key(key) => {
+                    if let Some(outcome) = handle_live_key(key, &mut ui) {
+                        stop_session(&mut ui);
+                        return Ok(outcome);
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if let Some(outcome) = handle_live_mouse(mouse, &mut ui) {
+                        stop_session(&mut ui);
+                        return Ok(outcome);
+                    }
+                }
                 Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
         }
     }
-
-    Ok(app.outcome)
 }
 
-fn handle_key(key: KeyEvent, app: &mut App) {
+fn drain_session_events(ui: &mut LiveUi) {
+    if let Some(session) = &ui.session {
+        while let Ok(event) = session.events.try_recv() {
+            match event {
+                SessionEvent::Status(status) => ui.status = status,
+                SessionEvent::Level(level) => ui.level = level,
+                SessionEvent::Microphone(name) => ui.microphone = name,
+                SessionEvent::Segment(line) => ui.transcript.push(line),
+                SessionEvent::Saved(path) => {
+                    ui.output_path = Some(path.clone());
+                    ui.message = format!("Saved {}", app::short_home_path(&path));
+                }
+                SessionEvent::Error(error) => {
+                    ui.message = error.clone();
+                    ui.status = SessionStatus::Error;
+                }
+            }
+        }
+    }
+}
+
+fn stop_session(ui: &mut LiveUi) {
+    if let Some(session) = &ui.session {
+        let _ = session.controls.send(SessionCommand::Stop);
+    }
+}
+
+fn handle_live_key(key: KeyEvent, ui: &mut LiveUi) -> Option<LiveOutcome> {
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.quit(),
-        KeyCode::Char('q') | KeyCode::Esc => app.quit(),
-        KeyCode::Char('i') => app.request_install(),
-        _ => {}
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(LiveOutcome::Quit)
+        }
+        KeyCode::Char('q') | KeyCode::Esc => Some(LiveOutcome::Quit),
+        KeyCode::Char(',') => Some(LiveOutcome::OpenConfig),
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            if let Some(session) = &ui.session {
+                let _ = session.controls.send(SessionCommand::SaveNow);
+            }
+            None
+        }
+        KeyCode::Char(' ') => {
+            if let Some(session) = &ui.session {
+                ui.paused = !ui.paused;
+                let _ = session.controls.send(SessionCommand::SetPaused(ui.paused));
+            }
+            None
+        }
+        KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            focus_next(ui);
+            None
+        }
+        KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            focus_prev(ui);
+            None
+        }
+        KeyCode::Enter => activate_live_focused(ui),
+        KeyCode::Char('i') => Some(LiveOutcome::InstallModel(ui.config.model.clone())),
+        _ => None,
     }
 }
 
-fn handle_mouse(mouse: MouseEvent, app: &mut App) {
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return;
-    }
-
-    let action = app
-        .mouse_targets
+fn handle_live_mouse(mouse: MouseEvent, ui: &mut LiveUi) -> Option<LiveOutcome> {
+    ui.hovered = ui
+        .targets
         .iter()
         .find(|target| contains(target.area, mouse.column, mouse.row))
-        .map(|target| target.action);
+        .map(|target| target.id);
 
-    match action {
-        Some(MouseAction::InstallModel) => app.request_install(),
-        Some(MouseAction::Quit) => app.quit(),
-        None => {}
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return None;
+    }
+
+    let target = ui
+        .targets
+        .iter()
+        .find(|target| contains(target.area, mouse.column, mouse.row) && target.enabled)
+        .cloned()?;
+    ui.focused = target.id;
+    match target.action {
+        TargetAction::Live(action) => run_live_action(ui, action),
+        TargetAction::Config(_) => None,
     }
 }
 
-fn contains(area: Rect, x: u16, y: u16) -> bool {
-    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
+fn activate_live_focused(ui: &mut LiveUi) -> Option<LiveOutcome> {
+    let action = ui
+        .targets
+        .iter()
+        .find(|target| target.id == ui.focused && target.enabled)
+        .map(|target| target.action);
+    match action {
+        Some(TargetAction::Live(action)) => run_live_action(ui, action),
+        _ => None,
+    }
 }
 
-fn render(frame: &mut Frame<'_>, app: &mut App) {
+fn run_live_action(ui: &mut LiveUi, action: LiveAction) -> Option<LiveOutcome> {
+    match action {
+        LiveAction::DownloadModel => Some(LiveOutcome::InstallModel(ui.config.model.clone())),
+        LiveAction::Settings => Some(LiveOutcome::OpenConfig),
+        LiveAction::Pause => {
+            if let Some(session) = &ui.session {
+                ui.paused = !ui.paused;
+                let _ = session.controls.send(SessionCommand::SetPaused(ui.paused));
+            }
+            None
+        }
+        LiveAction::Save => {
+            if let Some(session) = &ui.session {
+                let _ = session.controls.send(SessionCommand::SaveNow);
+            }
+            None
+        }
+        LiveAction::Quit => Some(LiveOutcome::Quit),
+    }
+}
+
+fn render_live(frame: &mut Frame<'_>, ui: &mut LiveUi) {
     let area = frame.area();
     let shell = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(8),
+            Constraint::Min(10),
             Constraint::Length(4),
         ])
         .split(area);
 
-    frame.render_widget(header(app), shell[0]);
-    let targets = render_body(frame, app, shell[1]);
-    frame.render_widget(commands(app), shell[2]);
-    app.set_mouse_targets(targets);
+    frame.render_widget(live_header(ui), shell[0]);
+    let targets = render_live_body(frame, ui, shell[1]);
+    frame.render_widget(live_footer(), shell[2]);
+    ui.targets = targets;
+    clamp_focus(ui);
 }
 
-fn render_body(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarget> {
-    match app.screen_mode {
-        ScreenMode::SetupRequired => render_setup(frame, app, area),
-        ScreenMode::EnginePending => render_engine_pending(frame, app, area),
+fn live_header(ui: &LiveUi) -> Paragraph<'_> {
+    let status = status_label(&ui.status);
+    let output = ui
+        .output_path
+        .as_ref()
+        .map(|path| app::short_home_path(path))
+        .unwrap_or_else(|| ui.config.output_dir.display().to_string());
+    Paragraph::new(Line::from(vec![
+        Span::styled(
+            "whisperCLI ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{status}  "), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{}  ", elapsed(ui.started_at)),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::raw(format!(
+            "model {}   mic {}   out {}",
+            ui.config.model, ui.microphone, output
+        )),
+    ]))
+    .block(base_block())
+}
+
+fn render_live_body(frame: &mut Frame<'_>, ui: &LiveUi, area: Rect) -> Vec<MouseTarget> {
+    if area.width >= 108 && area.height >= 20 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .split(area);
+        frame.render_widget(transcript_panel(ui), cols[0]);
+        render_live_sidebar(frame, ui, cols[1])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(10)])
+            .split(area);
+        frame.render_widget(transcript_panel(ui), rows[0]);
+        render_live_sidebar(frame, ui, rows[1])
     }
 }
 
-fn render_setup(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarget> {
-    let chunks = if area.width >= 94 && area.height >= 16 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(area)
+fn transcript_panel(ui: &LiveUi) -> Paragraph<'_> {
+    let mut lines = Vec::new();
+    if ui.transcript.is_empty() {
+        lines.push(Line::from(Span::styled(
+            empty_state_title(ui),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(empty_state_body(ui)));
+        if !ui.message.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Status: ", muted()),
+                Span::raw(ui.message.as_str()),
+            ]));
+        }
     } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(9), Constraint::Length(7)])
-            .split(area)
-    };
+        for line in ui.transcript.iter().rev().take(18).rev() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}  ", line.timestamp), muted()),
+                Span::raw(line.text.as_str()),
+            ]));
+        }
+    }
 
-    frame.render_widget(setup_message(app), chunks[0]);
-    render_actions(frame, app, chunks[1])
+    Paragraph::new(lines)
+        .block(base_block().title(" Transcript "))
+        .wrap(Wrap { trim: false })
 }
 
-fn render_engine_pending(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarget> {
-    let chunks = if area.width >= 104 && area.height >= 18 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(9), Constraint::Length(8)])
-            .split(area)
-    };
-
-    frame.render_widget(engine_message(app), chunks[0]);
-    render_actions(frame, app, chunks[1])
-}
-
-fn render_actions(frame: &mut Frame<'_>, app: &App, area: Rect) -> Vec<MouseTarget> {
+fn render_live_sidebar(frame: &mut Frame<'_>, ui: &LiveUi, area: Rect) -> Vec<MouseTarget> {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(8),
+            Constraint::Length(4),
             Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
         ])
         .split(area);
 
-    frame.render_widget(session(app), rows[0]);
+    frame.render_widget(session_panel(ui), rows[0]);
+    frame.render_widget(level_panel(ui), rows[1]);
 
-    let mut targets = Vec::new();
-    if app.screen_mode == ScreenMode::SetupRequired {
-        frame.render_widget(button("Install model", "click or press i"), rows[1]);
-        targets.push(MouseTarget {
-            area: rows[1],
-            action: MouseAction::InstallModel,
-        });
+    let actions = if ui.session.is_some() {
+        vec![
+            (
+                LiveAction::Pause,
+                if ui.paused { "Resume" } else { "Pause" },
+                "Space",
+            ),
+            (LiveAction::Save, "Save now", "S"),
+            (LiveAction::Settings, "Settings", ","),
+            (LiveAction::Quit, "Quit", "Q"),
+        ]
     } else {
-        frame.render_widget(status_panel("Recording unavailable", "this build cannot capture audio yet"), rows[1]);
-    }
-
-    frame.render_widget(button("Quit", "click or press q"), rows[2]);
-    targets.push(MouseTarget {
-        area: rows[2],
-        action: MouseAction::Quit,
-    });
-    targets
-}
-
-fn header(app: &App) -> Paragraph<'_> {
-    let title = Span::styled(
-        "whisperCLI",
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    );
-    let state = match app.screen_mode {
-        ScreenMode::SetupRequired => " SETUP ",
-        ScreenMode::EnginePending => " NOT RECORDING ",
+        vec![
+            (LiveAction::DownloadModel, "Download model", "I"),
+            (LiveAction::Settings, "Settings", ","),
+            (LiveAction::Quit, "Quit", "Q"),
+        ]
     };
-    let meta = Span::styled(
-        format!(
-            " {}   model {}   lang {}   out {}",
-            app.elapsed(),
-            app.args.model,
-            app.args.lang,
-            app.args.out
-        ),
-        Style::default().fg(Color::Gray),
-    );
 
-    Paragraph::new(Line::from(vec![
-        title,
-        Span::styled(state, Style::default().fg(Color::Gray)),
-        meta,
-    ]))
-    .block(base_block())
-    .alignment(Alignment::Left)
+    render_action_buttons(frame, ui, rows[2], actions)
 }
 
-fn setup_message(app: &App) -> Paragraph<'_> {
+fn session_panel(ui: &LiveUi) -> Paragraph<'_> {
+    let output = ui
+        .output_path
+        .as_ref()
+        .map(|path| app::short_home_path(path))
+        .unwrap_or_else(|| app::short_home_path(&ui.config.output_dir));
     let lines = vec![
-        Line::from(Span::styled(
-            "Model is not installed",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("A local model is required before transcription can start."),
-        Line::from("Press i or click Install model to download the recommended model."),
-        Line::from(""),
         Line::from(vec![
-            Span::styled("Recommended: ", muted()),
-            Span::raw(format!(
-                "{} ({})",
-                app.selected_model.name, app.selected_model.size
-            )),
+            Span::styled("status ", muted()),
+            Span::raw(status_label(&ui.status)),
         ]),
-        Line::from(vec![
-            Span::styled("Command:     ", muted()),
-            Span::raw(format!("whispercli models install {}", app.args.model)),
-        ]),
-    ];
-
-    Paragraph::new(lines)
-        .block(base_block().title(" Setup "))
-        .wrap(Wrap { trim: false })
-}
-
-fn engine_message(app: &App) -> Paragraph<'_> {
-    let lines = vec![
-        Line::from(Span::styled(
-            "Recording is not available in this build",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("The selected model is installed, but microphone capture is not enabled yet."),
-        Line::from("No transcript will appear until recording support is added."),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Output path: ", muted()),
-            Span::raw(app.args.out.as_str()),
-        ]),
-    ];
-
-    Paragraph::new(lines)
-        .block(base_block().title(" Transcription "))
-        .wrap(Wrap { trim: false })
-}
-
-fn session(app: &App) -> Paragraph<'_> {
-    let model_path = app.paths.models.join(app.selected_model.file_name);
-    let model_state = if model_path.exists() {
-        "installed"
-    } else {
-        "missing"
-    };
-    let rows = vec![
         Line::from(vec![
             Span::styled("model  ", muted()),
-            Span::raw(app.args.model.as_str()),
+            Span::raw(ui.config.model.as_str()),
         ]),
-        Line::from(vec![Span::styled("state  ", muted()), Span::raw(model_state)]),
         Line::from(vec![
             Span::styled("lang   ", muted()),
-            Span::raw(app.args.lang.as_str()),
+            Span::raw(ui.config.language.as_str()),
         ]),
         Line::from(vec![
-            Span::styled("output ", muted()),
-            Span::raw(app.args.out.as_str()),
+            Span::styled("format ", muted()),
+            Span::raw(ui.config.output_format.label()),
         ]),
-        Line::from(vec![
-            Span::styled("home   ", muted()),
-            Span::raw(short_home_path(&app.paths.root)),
-        ]),
+        Line::from(vec![Span::styled("output ", muted()), Span::raw(output)]),
     ];
-
-    Paragraph::new(rows)
+    Paragraph::new(lines)
         .block(base_block().title(" Session "))
         .wrap(Wrap { trim: true })
 }
 
-fn button(label: &'static str, hint: &'static str) -> Paragraph<'static> {
-    Paragraph::new(Line::from(vec![
-        Span::styled(label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {hint}"), muted()),
-    ]))
-    .block(base_block())
-    .alignment(Alignment::Center)
+fn level_panel(ui: &LiveUi) -> Gauge<'_> {
+    Gauge::default()
+        .block(base_block().title(" Input "))
+        .gauge_style(Style::default().fg(Color::White).bg(Color::Black))
+        .ratio(ui.level as f64)
+        .label(if ui.session.is_some() {
+            format!("{:>3}%", (ui.level * 100.0).round() as u8)
+        } else {
+            "not ready".to_string()
+        })
 }
 
-fn status_panel(label: &'static str, hint: &'static str) -> Paragraph<'static> {
-    Paragraph::new(Line::from(vec![
-        Span::styled(label, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("  {hint}"), muted()),
-    ]))
-    .block(base_block())
-    .alignment(Alignment::Center)
+fn render_action_buttons(
+    frame: &mut Frame<'_>,
+    ui: &LiveUi,
+    area: Rect,
+    actions: Vec<(LiveAction, &'static str, &'static str)>,
+) -> Vec<MouseTarget> {
+    let constraints = vec![Constraint::Length(3); actions.len()];
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let mut targets = Vec::new();
+    for (index, (action, label, hint)) in actions.into_iter().enumerate() {
+        let id = index;
+        let target = MouseTarget {
+            id,
+            area: rows[index],
+            enabled: true,
+            action: TargetAction::Live(action),
+        };
+        frame.render_widget(
+            button(label, hint, ui.hovered == Some(id), ui.focused == id, true),
+            rows[index],
+        );
+        targets.push(target);
+    }
+    targets
 }
 
-fn commands(app: &App) -> Paragraph<'static> {
-    let line = match app.screen_mode {
-        ScreenMode::SetupRequired => "Commands  i install model   q/Esc/Ctrl+C quit   click buttons to select",
-        ScreenMode::EnginePending => "Commands  q/Esc/Ctrl+C quit   click Quit to exit",
+fn live_footer() -> Paragraph<'static> {
+    Paragraph::new("Space pause/resume   S save   , settings   Tab focus   Enter select   Q quit")
+        .block(base_block().title(" Commands "))
+}
+
+fn status_label(status: &SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Loading => "LOADING",
+        SessionStatus::Listening => "LISTENING",
+        SessionStatus::Paused => "PAUSED",
+        SessionStatus::Processing => "PROCESSING",
+        SessionStatus::Saving => "SAVING",
+        SessionStatus::Error => "NEEDS SETUP",
+        SessionStatus::Stopped => "STOPPED",
+    }
+}
+
+fn empty_state_title(ui: &LiveUi) -> &'static str {
+    if ui.session.is_some() {
+        match ui.status {
+            SessionStatus::Listening => "Listening",
+            SessionStatus::Paused => "Paused",
+            SessionStatus::Processing => "Processing audio",
+            _ => "Preparing session",
+        }
+    } else {
+        "Setup required"
+    }
+}
+
+fn empty_state_body(ui: &LiveUi) -> &'static str {
+    if ui.session.is_some() {
+        match ui.status {
+            SessionStatus::Listening => {
+                "Speak normally. Transcript text will appear here after each processed audio chunk."
+            }
+            SessionStatus::Paused => {
+                "Audio capture is paused. Press Space or click Resume to continue."
+            }
+            SessionStatus::Processing => "Whisper is processing the current audio chunk.",
+            _ => "Loading the model and microphone.",
+        }
+    } else {
+        "Open Settings to choose a microphone and output folder, or download the selected model."
+    }
+}
+
+fn run_config_loop() -> Result<()> {
+    let paths = AppPaths::new()?;
+    paths.ensure()?;
+    loop {
+        let config = UserConfig::load_or_create(&paths)?;
+        match run_config_tui(paths.clone(), config)? {
+            ConfigOutcome::Back => return Ok(()),
+            ConfigOutcome::InstallModel(model) => install_model(&paths, &model)?,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum ConfigOutcome {
+    Back,
+    InstallModel(String),
+}
+
+struct ConfigUi {
+    paths: AppPaths,
+    config: UserConfig,
+    devices: Vec<audio::AudioDeviceInfo>,
+    output_dirs: Vec<PathBuf>,
+    section: usize,
+    message: String,
+    targets: Vec<MouseTarget>,
+    hovered: Option<usize>,
+    focused: usize,
+}
+
+fn run_config_tui(paths: AppPaths, config: UserConfig) -> Result<ConfigOutcome> {
+    let devices = input_devices().unwrap_or_default();
+    let output_dirs = output_dir_choices(&paths, &config);
+    let mut ui = ConfigUi {
+        paths,
+        config,
+        devices,
+        output_dirs,
+        section: 0,
+        message: "Select values with mouse, arrows, or Enter. Changes are saved with S."
+            .to_string(),
+        targets: Vec::new(),
+        hovered: None,
+        focused: 0,
     };
 
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).context("Failed to create terminal backend")?;
+
+    loop {
+        terminal.draw(|frame| render_config(frame, &mut ui))?;
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if let Some(outcome) = handle_config_key(key, &mut ui)? {
+                        return Ok(outcome);
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if let Some(outcome) = handle_config_mouse(mouse, &mut ui)? {
+                        return Ok(outcome);
+                    }
+                }
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+            }
+        }
+    }
+}
+
+fn output_dir_choices(paths: &AppPaths, config: &UserConfig) -> Vec<PathBuf> {
+    let mut dirs = vec![config.output_dir.clone(), paths.transcripts.clone()];
+    if let Some(documents) = app::documents_dir() {
+        dirs.push(documents.join("whisperCLI"));
+    }
+    if let Ok(current) = env::current_dir() {
+        dirs.push(current);
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn handle_config_key(key: KeyEvent, ui: &mut ConfigUi) -> Result<Option<ConfigOutcome>> {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Ok(Some(ConfigOutcome::Back))
+        }
+        KeyCode::Esc | KeyCode::Char('q') => Ok(Some(ConfigOutcome::Back)),
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            ui.config.save(&ui.paths)?;
+            ui.message = "Settings saved.".to_string();
+            Ok(None)
+        }
+        KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+            focus_next_config(ui);
+            Ok(None)
+        }
+        KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+            focus_prev_config(ui);
+            Ok(None)
+        }
+        KeyCode::Enter => activate_config_focused(ui),
+        _ => Ok(None),
+    }
+}
+
+fn handle_config_mouse(mouse: MouseEvent, ui: &mut ConfigUi) -> Result<Option<ConfigOutcome>> {
+    ui.hovered = ui
+        .targets
+        .iter()
+        .find(|target| contains(target.area, mouse.column, mouse.row))
+        .map(|target| target.id);
+
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return Ok(None);
+    }
+
+    let Some(target) = ui
+        .targets
+        .iter()
+        .find(|target| contains(target.area, mouse.column, mouse.row) && target.enabled)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    ui.focused = target.id;
+    match target.action {
+        TargetAction::Config(action) => run_config_action(ui, action),
+        TargetAction::Live(_) => Ok(None),
+    }
+}
+
+fn activate_config_focused(ui: &mut ConfigUi) -> Result<Option<ConfigOutcome>> {
+    let action = ui
+        .targets
+        .iter()
+        .find(|target| target.id == ui.focused && target.enabled)
+        .map(|target| target.action);
+    match action {
+        Some(TargetAction::Config(action)) => run_config_action(ui, action),
+        _ => Ok(None),
+    }
+}
+
+fn run_config_action(ui: &mut ConfigUi, action: ConfigAction) -> Result<Option<ConfigOutcome>> {
+    match action {
+        ConfigAction::Section(section) => ui.section = section,
+        ConfigAction::Model(index) => {
+            ui.config.model = MODELS[index].name.to_string();
+            ui.config.save(&ui.paths)?;
+            ui.message = format!("Selected model {}.", MODELS[index].name);
+        }
+        ConfigAction::DownloadModel(index) => {
+            return Ok(Some(ConfigOutcome::InstallModel(
+                MODELS[index].name.to_string(),
+            )))
+        }
+        ConfigAction::Device(index) => {
+            ui.config.microphone = ui.devices.get(index).map(|device| device.name.clone());
+            ui.config.save(&ui.paths)?;
+            ui.message = "Microphone selected.".to_string();
+        }
+        ConfigAction::OutputDir(index) => {
+            if let Some(path) = ui.output_dirs.get(index) {
+                ui.config.output_dir = path.clone();
+                ui.config.save(&ui.paths)?;
+                ui.message = "Output folder selected.".to_string();
+            }
+        }
+        ConfigAction::Format(index) => {
+            if let Some(format) = TranscriptFormat::all().get(index) {
+                ui.config.output_format = *format;
+                ui.config.save(&ui.paths)?;
+                ui.message = format!("Output format set to {}.", format.label());
+            }
+        }
+        ConfigAction::Language(index) => {
+            let languages = languages();
+            if let Some(language) = languages.get(index) {
+                ui.config.language = language.to_string();
+                ui.config.save(&ui.paths)?;
+                ui.message = format!("Language set to {language}.");
+            }
+        }
+        ConfigAction::Save => {
+            ui.config.save(&ui.paths)?;
+            ui.message = "Settings saved.".to_string();
+        }
+        ConfigAction::Back => return Ok(Some(ConfigOutcome::Back)),
+    }
+    Ok(None)
+}
+
+fn render_config(frame: &mut Frame<'_>, ui: &mut ConfigUi) {
+    let area = frame.area();
+    let shell = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(4),
+        ])
+        .split(area);
+    frame.render_widget(config_header(), shell[0]);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(40)])
+        .split(shell[1]);
+
+    let mut targets = render_config_sections(frame, ui, cols[0]);
+    targets.extend(render_config_detail(frame, ui, cols[1], targets.len()));
+    frame.render_widget(config_footer(ui), shell[2]);
+    ui.targets = targets;
+    clamp_focus_config(ui);
+}
+
+fn config_header() -> Paragraph<'static> {
     Paragraph::new(Line::from(vec![
-        Span::styled("Commands  ", muted()),
-        Span::raw(line.trim_start_matches("Commands  ")),
+        Span::styled(
+            "whisperCLI Settings",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "   configure model, microphone, output, and language",
+            muted(),
+        ),
     ]))
     .block(base_block())
+}
+
+fn render_config_sections(frame: &mut Frame<'_>, ui: &ConfigUi, area: Rect) -> Vec<MouseTarget> {
+    let sections = ["Model", "Microphone", "Output", "General"];
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(3); sections.len()])
+        .split(area);
+    let mut targets = Vec::new();
+    for (index, section) in sections.iter().enumerate() {
+        let id = targets.len();
+        let focused = ui.focused == id;
+        let hovered = ui.hovered == Some(id);
+        let selected = ui.section == index;
+        frame.render_widget(
+            selectable_row(section, selected, hovered, focused),
+            rows[index],
+        );
+        targets.push(MouseTarget {
+            id,
+            area: rows[index],
+            enabled: true,
+            action: TargetAction::Config(ConfigAction::Section(index)),
+        });
+    }
+    targets
+}
+
+fn render_config_detail(
+    frame: &mut Frame<'_>,
+    ui: &ConfigUi,
+    area: Rect,
+    id_offset: usize,
+) -> Vec<MouseTarget> {
+    match ui.section {
+        0 => render_model_settings(frame, ui, area, id_offset),
+        1 => render_microphone_settings(frame, ui, area, id_offset),
+        2 => render_output_settings(frame, ui, area, id_offset),
+        _ => render_general_settings(frame, ui, area, id_offset),
+    }
+}
+
+fn render_model_settings(
+    frame: &mut Frame<'_>,
+    ui: &ConfigUi,
+    area: Rect,
+    id_offset: usize,
+) -> Vec<MouseTarget> {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(3); MODELS.len() + 1])
+        .split(area);
+    let mut targets = Vec::new();
+    for (index, model) in MODELS.iter().enumerate() {
+        let id = id_offset + targets.len();
+        let installed = is_model_installed(&ui.paths, *model);
+        let selected = ui.config.model == model.name;
+        let label = format!(
+            "{} {}   {}   {}   {}",
+            if selected { "●" } else { "○" },
+            model.name,
+            model.size,
+            model.description,
+            if installed { "installed" } else { "download" }
+        );
+        frame.render_widget(
+            selectable_row(&label, selected, ui.hovered == Some(id), ui.focused == id),
+            rows[index],
+        );
+        targets.push(MouseTarget {
+            id,
+            area: rows[index],
+            enabled: true,
+            action: TargetAction::Config(ConfigAction::Model(index)),
+        });
+    }
+
+    let selected_index = MODELS
+        .iter()
+        .position(|model| model.name == ui.config.model)
+        .unwrap_or(0);
+    let id = id_offset + targets.len();
+    frame.render_widget(
+        button(
+            "Download selected model",
+            "Enter or click",
+            ui.hovered == Some(id),
+            ui.focused == id,
+            true,
+        ),
+        rows[MODELS.len()],
+    );
+    targets.push(MouseTarget {
+        id,
+        area: rows[MODELS.len()],
+        enabled: true,
+        action: TargetAction::Config(ConfigAction::DownloadModel(selected_index)),
+    });
+    targets
+}
+
+fn render_microphone_settings(
+    frame: &mut Frame<'_>,
+    ui: &ConfigUi,
+    area: Rect,
+    id_offset: usize,
+) -> Vec<MouseTarget> {
+    if ui.devices.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No input devices found. Check Windows microphone permissions and reconnect your microphone.")
+                .block(base_block().title(" Microphone "))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return Vec::new();
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(3); ui.devices.len()])
+        .split(area);
+    let mut targets = Vec::new();
+    for (index, device) in ui.devices.iter().enumerate() {
+        let id = id_offset + targets.len();
+        let selected = ui
+            .config
+            .microphone
+            .as_ref()
+            .map(|name| name == &device.name)
+            .unwrap_or(device.is_default);
+        let label = format!(
+            "{} {}{}",
+            if selected { "●" } else { "○" },
+            device.name,
+            if device.is_default { "  default" } else { "" }
+        );
+        frame.render_widget(
+            selectable_row(&label, selected, ui.hovered == Some(id), ui.focused == id),
+            rows[index],
+        );
+        targets.push(MouseTarget {
+            id,
+            area: rows[index],
+            enabled: true,
+            action: TargetAction::Config(ConfigAction::Device(index)),
+        });
+    }
+    targets
+}
+
+fn render_output_settings(
+    frame: &mut Frame<'_>,
+    ui: &ConfigUi,
+    area: Rect,
+    id_offset: usize,
+) -> Vec<MouseTarget> {
+    let item_count = ui.output_dirs.len() + TranscriptFormat::all().len();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(3); item_count])
+        .split(area);
+    let mut targets = Vec::new();
+
+    for (index, dir) in ui.output_dirs.iter().enumerate() {
+        let id = id_offset + targets.len();
+        let selected = ui.config.output_dir == *dir;
+        let label = format!(
+            "{} folder {}",
+            if selected { "●" } else { "○" },
+            app::short_home_path(dir)
+        );
+        frame.render_widget(
+            selectable_row(&label, selected, ui.hovered == Some(id), ui.focused == id),
+            rows[index],
+        );
+        targets.push(MouseTarget {
+            id,
+            area: rows[index],
+            enabled: true,
+            action: TargetAction::Config(ConfigAction::OutputDir(index)),
+        });
+    }
+
+    for (index, format) in TranscriptFormat::all().iter().enumerate() {
+        let row_index = ui.output_dirs.len() + index;
+        let id = id_offset + targets.len();
+        let selected = ui.config.output_format == *format;
+        let label = format!(
+            "{} format {}",
+            if selected { "●" } else { "○" },
+            format.label()
+        );
+        frame.render_widget(
+            selectable_row(&label, selected, ui.hovered == Some(id), ui.focused == id),
+            rows[row_index],
+        );
+        targets.push(MouseTarget {
+            id,
+            area: rows[row_index],
+            enabled: true,
+            action: TargetAction::Config(ConfigAction::Format(index)),
+        });
+    }
+    targets
+}
+
+fn render_general_settings(
+    frame: &mut Frame<'_>,
+    ui: &ConfigUi,
+    area: Rect,
+    id_offset: usize,
+) -> Vec<MouseTarget> {
+    let langs = languages();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(3); langs.len() + 2])
+        .split(area);
+    let mut targets = Vec::new();
+    for (index, language) in langs.iter().enumerate() {
+        let id = id_offset + targets.len();
+        let selected = ui.config.language == *language;
+        let label = format!("{} language {}", if selected { "●" } else { "○" }, language);
+        frame.render_widget(
+            selectable_row(&label, selected, ui.hovered == Some(id), ui.focused == id),
+            rows[index],
+        );
+        targets.push(MouseTarget {
+            id,
+            area: rows[index],
+            enabled: true,
+            action: TargetAction::Config(ConfigAction::Language(index)),
+        });
+    }
+
+    let id = id_offset + targets.len();
+    frame.render_widget(
+        button(
+            "Save settings",
+            "S",
+            ui.hovered == Some(id),
+            ui.focused == id,
+            true,
+        ),
+        rows[langs.len()],
+    );
+    targets.push(MouseTarget {
+        id,
+        area: rows[langs.len()],
+        enabled: true,
+        action: TargetAction::Config(ConfigAction::Save),
+    });
+
+    let id = id_offset + targets.len();
+    frame.render_widget(
+        button(
+            "Back to transcription",
+            "Esc",
+            ui.hovered == Some(id),
+            ui.focused == id,
+            true,
+        ),
+        rows[langs.len() + 1],
+    );
+    targets.push(MouseTarget {
+        id,
+        area: rows[langs.len() + 1],
+        enabled: true,
+        action: TargetAction::Config(ConfigAction::Back),
+    });
+    targets
+}
+
+fn config_footer(ui: &ConfigUi) -> Paragraph<'_> {
+    Paragraph::new(Line::from(vec![
+        Span::styled("Message  ", muted()),
+        Span::raw(ui.message.as_str()),
+        Span::styled("    Tab focus   Enter select   S save   Esc back", muted()),
+    ]))
+    .block(base_block().title(" Commands "))
     .wrap(Wrap { trim: true })
+}
+
+fn languages() -> &'static [&'static str] {
+    &["ja", "auto", "en"]
+}
+
+fn focus_next(ui: &mut LiveUi) {
+    if ui.targets.is_empty() {
+        return;
+    }
+    ui.focused = (ui.focused + 1) % ui.targets.len();
+}
+
+fn focus_prev(ui: &mut LiveUi) {
+    if ui.targets.is_empty() {
+        return;
+    }
+    ui.focused = if ui.focused == 0 {
+        ui.targets.len() - 1
+    } else {
+        ui.focused - 1
+    };
+}
+
+fn clamp_focus(ui: &mut LiveUi) {
+    if ui.targets.is_empty() {
+        ui.focused = 0;
+    } else if ui.focused >= ui.targets.len() {
+        ui.focused = ui.targets.len() - 1;
+    }
+}
+
+fn focus_next_config(ui: &mut ConfigUi) {
+    if ui.targets.is_empty() {
+        return;
+    }
+    ui.focused = (ui.focused + 1) % ui.targets.len();
+}
+
+fn focus_prev_config(ui: &mut ConfigUi) {
+    if ui.targets.is_empty() {
+        return;
+    }
+    ui.focused = if ui.focused == 0 {
+        ui.targets.len() - 1
+    } else {
+        ui.focused - 1
+    };
+}
+
+fn clamp_focus_config(ui: &mut ConfigUi) {
+    if ui.targets.is_empty() {
+        ui.focused = 0;
+    } else if ui.focused >= ui.targets.len() {
+        ui.focused = ui.targets.len() - 1;
+    }
+}
+
+fn button(
+    label: &'static str,
+    hint: &'static str,
+    hovered: bool,
+    focused: bool,
+    enabled: bool,
+) -> Paragraph<'static> {
+    let style = control_style(hovered, focused, enabled);
+    Paragraph::new(Line::from(vec![
+        Span::styled(
+            label,
+            Style::default()
+                .fg(if enabled {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {hint}"), muted()),
+    ]))
+    .block(base_block().border_style(style))
+    .alignment(Alignment::Center)
+}
+
+fn selectable_row(label: &str, selected: bool, hovered: bool, focused: bool) -> Paragraph<'_> {
+    let marker_style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Paragraph::new(Line::from(vec![Span::styled(
+        label.to_string(),
+        marker_style,
+    )]))
+    .block(base_block().border_style(control_style(hovered, focused, true)))
+}
+
+fn control_style(hovered: bool, focused: bool, enabled: bool) -> Style {
+    if !enabled {
+        Style::default().fg(Color::DarkGray)
+    } else if focused {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if hovered {
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 fn base_block() -> Block<'static> {
@@ -708,80 +1392,16 @@ fn muted() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-fn short_home_path(path: &Path) -> String {
-    let home = match home_dir() {
-        Ok(home) => home,
-        Err(_) => return path.display().to_string(),
-    };
-
-    if let Ok(stripped) = path.strip_prefix(home) {
-        let rest = stripped.display().to_string();
-        if rest.is_empty() {
-            "~".to_string()
-        } else {
-            format!("~\\{}", rest.trim_start_matches(['\\', '/']))
-        }
-    } else {
-        path.display().to_string()
-    }
+fn contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height
 }
 
-fn home_dir() -> Result<PathBuf> {
-    env::var_os("USERPROFILE")
-        .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("Neither USERPROFILE nor HOME is set"))
-}
-
-fn add_current_exe_dir_to_path() -> Result<()> {
-    if env::consts::OS != "windows" {
-        println!("--add-to-path is currently implemented for Windows only.");
-        println!(
-            "Add this directory to PATH manually: {}",
-            current_exe_dir()?.display()
-        );
-        return Ok(());
-    }
-
-    let exe_dir = current_exe_dir()?;
-    let exe_dir_text = exe_dir.display().to_string();
-
-    let script = r#"
-$dir = $args[0]
-$current = [Environment]::GetEnvironmentVariable("Path", "User")
-$entries = @()
-if ($current) {
-    $entries = $current.Split(";") | Where-Object { $_ -ne "" }
-}
-foreach ($entry in $entries) {
-    if ($entry.TrimEnd("\") -ieq $dir.TrimEnd("\")) {
-        Write-Host "PATH already contains $dir"
-        exit 0
-    }
-}
-$updated = if ($current) { "$current;$dir" } else { $dir }
-[Environment]::SetEnvironmentVariable("Path", $updated, "User")
-Write-Host "Added $dir to the user PATH"
-"#;
-
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
-        .arg(&exe_dir_text)
-        .status()
-        .context("Failed to update the user PATH with PowerShell")?;
-
-    if !status.success() {
-        bail!("PowerShell PATH update failed with status {status}");
-    }
-
-    println!("Added {} to the user PATH.", exe_dir.display());
-    println!("Open a new terminal before running whispercli by name.");
-    Ok(())
-}
-
-fn current_exe_dir() -> Result<PathBuf> {
-    let exe = env::current_exe().context("Failed to locate current executable")?;
-    exe.parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("Executable has no parent directory: {}", exe.display()))
+fn elapsed(start: Instant) -> String {
+    let secs = start.elapsed().as_secs();
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }

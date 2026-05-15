@@ -15,9 +15,9 @@
 
 ### Remaining engineering risks
 
-- The current live screen is an honest setup/readiness screen. `cpal` audio input and `whisper-rs` inference are the next core implementation step before real transcription can appear.
-- `cargo check` could not be run on the local machine because Rust is not installed in PATH.
-- `Cargo.lock` is not generated yet for the same reason. It should be committed after the first successful local or CI build.
+- Live transcription now uses `cpal` for microphone capture and `whisper-rs` for chunked whisper.cpp inference, but short-chunk duplicate suppression and silence detection will need more real-world tuning.
+- Native folder picking is represented as selectable common output folders in the TUI; a true OS folder picker is intentionally not used so the app remains terminal-native.
+- Local default-feature builds require libclang for `whisper-rs` bindgen. CI installs LLVM before building release binaries; end users receive native binaries and do not need LLVM.
 
 ## UX review
 

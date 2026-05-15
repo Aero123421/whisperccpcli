@@ -1,6 +1,6 @@
 [package]
 name = "whispercli"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 description = "A lightweight, local-first Whisper CLI with a calm real-time TUI."
 license = "MIT"
@@ -9,7 +9,16 @@ repository = "https://github.com/Aero123421/whisperccpcli"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+cpal = "0.17"
+crossbeam-channel = "0.5"
 crossterm = "0.28"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
 sha1 = "0.10"
+toml = "0.9"
+whisper-rs = { version = "0.16", optional = true }
+
+[features]
+default = ["whisper"]
+whisper = ["dep:whisper-rs"]

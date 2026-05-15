@@ -3,7 +3,7 @@
 Rust製の軽量リアルタイム文字起こしCLIです。
 
 現在のMVPは、`ratatui` + `crossterm` によるリッチTUI、ユーザー配下の
-`~/.whispercli` 初期化、モデル管理、配布導線の土台です。
+`~/.whispercli` 初期化、モデル管理、マイク入力、whisper.cpp推論、逐次保存の土台です。
 
 端末サイズに応じて、横分割レイアウトと縦積みレイアウトを切り替えます。
 
@@ -35,6 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/Aero123421/whisperccpcli/main/scrip
 
 ```powershell
 whispercli init
+whispercli config
 whispercli models install tiny
 whispercli models list
 ```
@@ -55,6 +56,12 @@ Installed binary:
 
 ```powershell
 whispercli
+```
+
+Settings:
+
+```powershell
+whispercli config
 ```
 
 With options:
@@ -80,20 +87,21 @@ Click Install model / Quit buttons in the TUI.
 - リッチTUI
 - レスポンシブレイアウト
 - `whispercli` だけで起動
-- モデル未導入時のセットアップ画面
-- デモ文字起こし・ダミー音量表示なし
-- マウスクリック操作
-- 保存先、モデル、言語、状態の表示
+- `whispercli config` でモデル、マイク、保存先、保存形式を変更
+- マウスホバー、フォーカス、選択状態の表示
+- `cpal` によるマイク入力
+- `whisper-rs` / `whisper.cpp` によるチャンク文字起こし
+- Markdown / Text への逐次保存
+- 保存先、モデル、言語、状態、入力レベルの表示
 - `~/.whispercli` の自動作成
-- `tiny` / `base` モデルのダウンロードとSHA1検証
+- `tiny` / `base` / `small` モデルのダウンロードとSHA1検証
 - GitHub ActionsによるCI/CD
 - npm wrapper
 - Windows用PowerShellインストーラー
 
 ## Later
 
-- `cpal` によるマイク入力
-- `whisper-rs` / `whisper.cpp` による文字起こし
-- `.txt` / `.md` 保存
-- モデルダウンロード
+- 重複除去とVADの精度改善
+- SRT / JSON 出力
+- ファイル音声の文字起こし
 - Windows/macOS/Linux向け単体バイナリ配布
