@@ -44,6 +44,20 @@ function Add-ToUserPath($Directory) {
     Write-Host "Open a new terminal before running whispercli by name."
 }
 
+function Test-FileWritable($Path) {
+    if (!(Test-Path $Path)) {
+        return
+    }
+
+    try {
+        $stream = [System.IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
+        $stream.Close()
+    }
+    catch {
+        throw "Cannot update $Path because it is currently in use. Close all running whisperCLI windows, then run this installer again."
+    }
+}
+
 try {
     Write-Step "Creating $RootDir"
     New-Item -ItemType Directory -Force -Path $RootDir | Out-Null
@@ -59,9 +73,10 @@ try {
     Invoke-WebRequest -Uri $url -OutFile $ZipPath
 
     Write-Step "Installing to $InstallDir"
-    Expand-Archive -Path $ZipPath -DestinationPath $InstallDir -Force
-
     $exe = Join-Path $InstallDir "whispercli.exe"
+    Test-FileWritable $exe
+    Expand-Archive -Path $ZipPath -DestinationPath $InstallDir -Force -ErrorAction Stop
+
     if (!(Test-Path $exe)) {
         throw "Install failed: $exe was not found in the downloaded archive."
     }
