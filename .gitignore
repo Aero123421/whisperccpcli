@@ -1,0 +1,6 @@
+/target
+/dist
+/npm/vendor
+/npm/*.tgz
+*.pdb
+*.exe
