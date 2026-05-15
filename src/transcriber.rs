@@ -19,7 +19,7 @@ use std::{
     fs::{self, File},
     io::Write,
     path::PathBuf,
-    thread,
+    thread::{self, JoinHandle},
     time::Duration,
 };
 #[cfg(feature = "whisper")]
@@ -65,6 +65,16 @@ pub struct SessionHandle {
     pub events: Receiver<SessionEvent>,
     pub controls: Sender<SessionCommand>,
     pub output_path: PathBuf,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl SessionHandle {
+    pub fn stop_and_wait(&mut self) {
+        let _ = self.controls.send(SessionCommand::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 pub fn start_session(
@@ -85,7 +95,7 @@ pub fn start_session(
     let worker_config = config.clone();
     let worker_output = output_path.clone();
 
-    thread::spawn(move || {
+    let worker = thread::spawn(move || {
         if let Err(error) = run_worker(
             worker_paths,
             worker_config,
@@ -102,6 +112,7 @@ pub fn start_session(
         events: event_rx,
         controls: command_tx,
         output_path,
+        worker: Some(worker),
     })
 }
 
@@ -135,7 +146,7 @@ fn run_worker(
             .create_state()
             .context("Failed to create whisper state")?;
 
-        let (audio_tx, audio_rx) = bounded::<Vec<f32>>(64);
+        let (audio_tx, audio_rx) = bounded::<Vec<f32>>(512);
         let (level_tx, level_rx) = bounded::<f32>(8);
         let (stream_error_tx, stream_error_rx) = bounded::<String>(8);
         let capture = audio::start_capture(
@@ -321,7 +332,7 @@ fn is_duplicate(previous: &str, current: &str) -> bool {
 }
 
 fn resolve_output_path(config: &UserConfig, out_override: Option<String>) -> PathBuf {
-    let file_name = out_override.unwrap_or_else(|| "meeting".to_string());
+    let file_name = out_override.unwrap_or_else(|| format!("meeting-{}", timestamp_for_file()));
     let mut path = PathBuf::from(file_name);
     path.set_extension(config.output_format.extension());
 
@@ -342,8 +353,14 @@ fn write_transcript(
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
+    let temp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("txt")
+    ));
     let mut file =
-        File::create(path).with_context(|| format!("Failed to create {}", path.display()))?;
+        File::create(&temp).with_context(|| format!("Failed to create {}", temp.display()))?;
     match format {
         TranscriptFormat::Md => {
             writeln!(file, "# Transcript")?;
@@ -358,10 +375,27 @@ fn write_transcript(
             }
         }
     }
+    file.flush()?;
+    fs::rename(&temp, path).with_context(|| format!("Failed to replace {}", path.display()))?;
     Ok(())
 }
 
 fn format_elapsed(duration: Duration) -> String {
     let secs = duration.as_secs();
-    format!("{:02}:{:02}", (secs / 60) % 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
+fn timestamp_for_file() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    secs.to_string()
 }

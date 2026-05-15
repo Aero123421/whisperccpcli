@@ -48,7 +48,7 @@ jobs:
             sudo apt-get install -y libclang-dev libasound2-dev
           fi
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package
         shell: pwsh
         run: ./scripts/package-release.ps1 -Target "${{ matrix.target }}" -AssetName "${{ matrix.asset }}"

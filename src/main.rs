@@ -328,12 +328,13 @@ fn run_live_tui(
     config: UserConfig,
     out_override: Option<String>,
 ) -> Result<LiveOutcome> {
+    let mut startup_error = String::new();
     let session = match model_by_name(&config.model) {
         Some(model) if is_model_installed(&paths, model) => {
             match start_session(paths.clone(), config.clone(), out_override) {
                 Ok(handle) => Some(handle),
                 Err(error) => {
-                    eprintln!("error: {error:#}");
+                    startup_error = format!("{error:#}");
                     None
                 }
             }
@@ -341,6 +342,7 @@ fn run_live_tui(
         _ => None,
     };
 
+    let start_paused = config.start_paused;
     let mut ui = LiveUi {
         output_path: session.as_ref().map(|session| session.output_path.clone()),
         session,
@@ -349,7 +351,7 @@ fn run_live_tui(
         transcript: Vec::new(),
         microphone: "default".to_string(),
         level: 0.0,
-        paused: false,
+        paused: start_paused,
         started_at: Instant::now(),
         message: String::new(),
         targets: Vec::new(),
@@ -359,7 +361,11 @@ fn run_live_tui(
 
     if ui.session.is_none() {
         ui.status = SessionStatus::Error;
-        ui.message = "Install a model and choose a microphone in Settings.".to_string();
+        ui.message = if startup_error.is_empty() {
+            "Install a model and choose a microphone in Settings.".to_string()
+        } else {
+            startup_error
+        };
     }
 
     let _guard = TerminalGuard::enter()?;
@@ -413,8 +419,8 @@ fn drain_session_events(ui: &mut LiveUi) {
 }
 
 fn stop_session(ui: &mut LiveUi) {
-    if let Some(session) = &ui.session {
-        let _ = session.controls.send(SessionCommand::Stop);
+    if let Some(session) = &mut ui.session {
+        session.stop_and_wait();
     }
 }
 

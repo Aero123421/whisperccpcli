@@ -36,13 +36,13 @@ jobs:
             sudo apt-get install -y libclang-dev libasound2-dev
           fi
       - name: Format
-        run: cargo fmt --all
+        run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
-        run: cargo test --all
+        run: cargo test --locked --all
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
 
   npm:
     name: npm package
